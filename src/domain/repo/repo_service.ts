@@ -206,7 +206,7 @@ Use \`swamp --help\` to see available commands.
   private async createDataDirectoryStructure(
     repoPath: RepoPath,
   ): Promise<void> {
-    const dataDir = join(repoPath.value, ".data");
+    const dataDir = join(repoPath.value, ".swamp");
     const subdirs = [
       "inputs",
       "resources",
@@ -216,6 +216,10 @@ Use \`swamp --help\` to see available commands.
       "workflow-runs",
       "inputs-evaluated",
       "workflows-evaluated",
+      "definitions",
+      "definitions-evaluated",
+      "vault",
+      "secrets",
       "logs",
       "files",
     ];
