@@ -276,9 +276,9 @@ Deno.test("CLI: workflow run with missing required input fails", async () => {
             {
               name: "step1",
               task: {
-                type: "shell",
-                command: "echo",
-                args: ["test"],
+                type: "model_method",
+                modelIdOrName: "test-model",
+                methodName: "run",
               },
               dependsOn: [],
               weight: 0,
@@ -318,6 +318,23 @@ Deno.test("CLI: workflow run with input-file works", async () => {
   await withTempDir(async (repoDir) => {
     await initializeTestRepo(repoDir);
 
+    // Create model definition so the step can execute
+    const modelData = {
+      type: "swamp/echo",
+      typeVersion: 1,
+      id: crypto.randomUUID(),
+      name: "test-model",
+      version: 1,
+      tags: {},
+      attributes: { message: "hello" },
+    };
+    const modelDir = join(repoDir, ".swamp/definitions/swamp/echo");
+    await ensureDir(modelDir);
+    await Deno.writeTextFile(
+      join(modelDir, `${modelData.id}.yaml`),
+      stringifyYaml(modelData as Record<string, unknown>),
+    );
+
     // Create workflow with inputs
     const workflowData = {
       id: crypto.randomUUID(),
@@ -336,9 +353,9 @@ Deno.test("CLI: workflow run with input-file works", async () => {
             {
               name: "step1",
               task: {
-                type: "shell",
-                command: "echo",
-                args: ["${{ inputs.message }}"],
+                type: "model_method",
+                modelIdOrName: "test-model",
+                methodName: "write",
               },
               dependsOn: [],
               weight: 0,

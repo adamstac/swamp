@@ -92,6 +92,7 @@ Deno.test("CLI: workflow with forEach over array creates multiple steps", async 
   await withTempDir(async (repoDir) => {
     await initializeTestRepo(repoDir);
     await createEchoModel(repoDir, "echo-model");
+    await createEchoModel(repoDir, "test-model");
 
     // Create workflow with forEach over array
     const workflowData = {
@@ -121,9 +122,9 @@ Deno.test("CLI: workflow with forEach over array creates multiple steps", async 
                 in: "${{ inputs.environments }}",
               },
               task: {
-                type: "shell",
-                command: "echo",
-                args: ["Deploying to ${{ self.env }}"],
+                type: "model_method",
+                modelIdOrName: "test-model",
+                methodName: "write",
               },
               dependsOn: [],
               weight: 0,
@@ -175,6 +176,7 @@ Deno.test("CLI: workflow with forEach single item array", async () => {
   await withTempDir(async (repoDir) => {
     await initializeTestRepo(repoDir);
     await createEchoModel(repoDir, "echo-single");
+    await createEchoModel(repoDir, "test-model");
 
     const workflowData = {
       id: crypto.randomUUID(),
@@ -200,9 +202,9 @@ Deno.test("CLI: workflow with forEach single item array", async () => {
                 in: "${{ inputs.items }}",
               },
               task: {
-                type: "shell",
-                command: "echo",
-                args: ["${{ self.item }}"],
+                type: "model_method",
+                modelIdOrName: "test-model",
+                methodName: "write",
               },
               dependsOn: [],
               weight: 0,
@@ -268,9 +270,9 @@ Deno.test("CLI: workflow with forEach validates array minItems", async () => {
                 in: "${{ inputs.environments }}",
               },
               task: {
-                type: "shell",
-                command: "echo",
-                args: ["test"],
+                type: "model_method",
+                modelIdOrName: "test-model",
+                methodName: "write",
               },
               dependsOn: [],
               weight: 0,
@@ -313,6 +315,7 @@ Deno.test("CLI: workflow with forEach validates array minItems", async () => {
 Deno.test("CLI: workflow with forEach over object", async () => {
   await withTempDir(async (repoDir) => {
     await initializeTestRepo(repoDir);
+    await createEchoModel(repoDir, "test-model");
 
     const workflowData = {
       id: crypto.randomUUID(),
@@ -340,9 +343,9 @@ Deno.test("CLI: workflow with forEach over object", async () => {
                 in: "${{ inputs.tags }}",
               },
               task: {
-                type: "shell",
-                command: "echo",
-                args: ["${{ self.tag.key }}=${{ self.tag.value }}"],
+                type: "model_method",
+                modelIdOrName: "test-model",
+                methodName: "write",
               },
               dependsOn: [],
               weight: 0,
@@ -406,9 +409,9 @@ Deno.test("CLI: workflow with forEach over empty object succeeds", async () => {
                 in: "${{ inputs.tags }}",
               },
               task: {
-                type: "shell",
-                command: "echo",
-                args: ["tag"],
+                type: "model_method",
+                modelIdOrName: "test-model",
+                methodName: "write",
               },
               dependsOn: [],
               weight: 0,
@@ -451,6 +454,7 @@ Deno.test("CLI: workflow with forEach over empty object succeeds", async () => {
 Deno.test("CLI: workflow with mixed forEach and regular steps", async () => {
   await withTempDir(async (repoDir) => {
     await initializeTestRepo(repoDir);
+    await createEchoModel(repoDir, "test-model");
 
     const workflowData = {
       id: crypto.randomUUID(),
@@ -472,9 +476,9 @@ Deno.test("CLI: workflow with mixed forEach and regular steps", async () => {
             {
               name: "prepare",
               task: {
-                type: "shell",
-                command: "echo",
-                args: ["Preparing..."],
+                type: "model_method",
+                modelIdOrName: "test-model",
+                methodName: "write",
               },
               dependsOn: [],
               weight: 0,
@@ -486,9 +490,9 @@ Deno.test("CLI: workflow with mixed forEach and regular steps", async () => {
                 in: "${{ inputs.environments }}",
               },
               task: {
-                type: "shell",
-                command: "echo",
-                args: ["Deploying to ${{ self.env }}"],
+                type: "model_method",
+                modelIdOrName: "test-model",
+                methodName: "write",
               },
               dependsOn: [
                 {
@@ -501,9 +505,9 @@ Deno.test("CLI: workflow with mixed forEach and regular steps", async () => {
             {
               name: "cleanup",
               task: {
-                type: "shell",
-                command: "echo",
-                args: ["Cleaning up..."],
+                type: "model_method",
+                modelIdOrName: "test-model",
+                methodName: "write",
               },
               dependsOn: [],
               weight: 0,
