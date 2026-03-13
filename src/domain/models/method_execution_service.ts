@@ -20,6 +20,7 @@
 import type { z } from "zod";
 import {
   type DataHandle,
+  type FileOutputSpec,
   type FollowUpAction,
   inferMethodKind,
   isMutatingKind,
@@ -27,6 +28,7 @@ import {
   type MethodDefinition,
   type MethodResult,
   type ModelDefinition,
+  type ResourceOutputSpec,
 } from "./model.ts";
 import type { Definition } from "../definitions/definition.ts";
 import { UserError } from "../errors.ts";
@@ -41,6 +43,9 @@ import {
 import { coerceMethodArgs } from "./zod_type_coercion.ts";
 import { containsExpression } from "../expressions/expression_parser.ts";
 import type { Data } from "../data/data.ts";
+import type { DriverOutput } from "../drivers/execution_driver.ts";
+import { RawExecutionDriver } from "../drivers/raw_execution_driver.ts";
+import { driverTypeRegistry } from "../drivers/driver_type_registry.ts";
 
 /**
  * Maximum depth for recursive follow-up action processing.
@@ -62,6 +67,99 @@ function filterDeclaredResourceData(
     d.tags["specName"] !== undefined &&
     specNames.has(d.tags["specName"])
   );
+}
+
+/**
+ * Context needed to persist "pending" driver outputs on the host side.
+ * Uses types from MethodContext to avoid direct infrastructure imports.
+ */
+interface PersistContext extends
+  Pick<
+    MethodContext,
+    | "dataRepository"
+    | "modelType"
+    | "modelId"
+    | "tagOverrides"
+    | "runtimeTags"
+    | "vaultService"
+  > {
+  resources: Record<string, ResourceOutputSpec>;
+  files: Record<string, FileOutputSpec>;
+  definitionTags?: Record<string, string>;
+  definitionName?: string;
+  methodName?: string;
+}
+
+/**
+ * Converts DriverOutput[] to DataHandle[].
+ * For "persisted" outputs, extracts the handle directly.
+ * For "pending" outputs (from out-of-process drivers), persists data
+ * via the host-side DataWriter infrastructure.
+ */
+async function processDriverOutputs(
+  outputs: DriverOutput[],
+  persistContext?: PersistContext,
+): Promise<DataHandle[]> {
+  const handles: DataHandle[] = [];
+  for (const output of outputs) {
+    if (output.kind === "persisted") {
+      handles.push(output.handle);
+    } else if (output.kind === "pending" && persistContext) {
+      if (output.type === "resource") {
+        const { writeResource } = createResourceWriter(
+          persistContext.dataRepository,
+          persistContext.modelType,
+          persistContext.modelId,
+          persistContext.resources,
+          persistContext.tagOverrides,
+          undefined, // dataOutputOverrides
+          persistContext.definitionTags,
+          persistContext.runtimeTags,
+          persistContext.definitionName,
+          persistContext.vaultService,
+          persistContext.methodName,
+        );
+        // Shape the raw content into resource data.
+        // If content is valid JSON, use it directly.
+        // Otherwise, build structured data from driver metadata + raw stdout.
+        const text = new TextDecoder().decode(output.content);
+        let data: Record<string, unknown>;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          const meta = output.metadata ?? {};
+          data = {
+            ...meta,
+            executedAt: new Date().toISOString(),
+            stdout: text,
+          };
+        }
+        const handle = await writeResource(
+          output.specName,
+          output.name,
+          data,
+        );
+        handles.push(handle);
+      } else if (output.type === "file") {
+        const { createFileWriter } = createFileWriterFactory(
+          persistContext.dataRepository,
+          persistContext.modelType,
+          persistContext.modelId,
+          persistContext.files,
+          persistContext.tagOverrides,
+          undefined, // dataOutputOverrides
+          undefined, // callbacks
+          persistContext.definitionTags,
+          persistContext.runtimeTags,
+          persistContext.definitionName,
+        );
+        const writer = createFileWriter(output.specName, output.name);
+        const handle = await writer.writeAll(output.content);
+        handles.push(handle);
+      }
+    }
+  }
+  return handles;
 }
 
 /**
@@ -413,59 +511,117 @@ export class DefaultMethodExecutionService implements MethodExecutionService {
       }
     }
 
-    // Create writeResource and createFileWriter for this execution
+    // Resolve the execution driver
+    const driverType = context.driver ?? "raw";
     const definitionHash = await currentDefinition.computeHash();
-    const resources = modelDef.resources ?? {};
-    const files = modelDef.files ?? {};
 
-    const {
-      writeResource,
-      getHandles: _getResourceHandles,
-    } = createResourceWriter(
-      context.dataRepository,
-      context.modelType,
-      context.modelId,
-      resources,
-      context.tagOverrides,
-      context.dataOutputOverrides,
-      currentDefinition.tags,
-      context.runtimeTags,
-      currentDefinition.name,
-      context.vaultService,
-      methodName,
-    );
+    const executionRequest:
+      import("../drivers/execution_driver.ts").ExecutionRequest = {
+        protocolVersion: 1,
+        modelType: context.modelType.normalized,
+        modelId: context.modelId,
+        methodName,
+        globalArgs: currentDefinition.globalArguments,
+        methodArgs: currentDefinition.getMethodArguments(methodName),
+        definitionMeta: {
+          id: currentDefinition.id,
+          name: currentDefinition.name,
+          version: currentDefinition.version,
+          tags: currentDefinition.tags,
+        },
+        resourceSpecs: modelDef.resources
+          ? Object.fromEntries(
+            Object.entries(modelDef.resources).map(([name, spec]) => [
+              name,
+              { description: spec.description },
+            ]),
+          )
+          : undefined,
+        fileSpecs: modelDef.files
+          ? Object.fromEntries(
+            Object.entries(modelDef.files).map(([name, spec]) => [
+              name,
+              { contentType: spec.contentType },
+            ]),
+          )
+          : undefined,
+        bundle: modelDef.bundleSource
+          ? new TextEncoder().encode(modelDef.bundleSource)
+          : undefined,
+      };
 
-    const {
-      createFileWriter,
-      getHandles: _getFileHandles,
-    } = createFileWriterFactory(
-      context.dataRepository,
-      context.modelType,
-      context.modelId,
-      files,
-      context.tagOverrides,
-      context.dataOutputOverrides,
-      undefined, // callbacks
-      currentDefinition.tags,
-      context.runtimeTags,
-      currentDefinition.name,
-    );
+    let currentHandles: DataHandle[];
+    let result: MethodResult;
+    let executionContext: MethodContext = context;
 
-    // Inject into context
-    const contextWithWriters: MethodContext = {
-      ...context,
-      methodName,
-      writeResource,
-      createFileWriter,
-    };
+    if (driverType === "raw") {
+      // Use the raw in-process driver
+      const driver = new RawExecutionDriver(
+        this,
+        currentDefinition,
+        method,
+        modelDef,
+        context,
+        methodName,
+      );
+      const driverResult = await driver.execute(executionRequest);
 
-    // Execute the initial method
-    const result = await this.execute(
-      currentDefinition,
-      method,
-      contextWithWriters,
-    );
-    let currentHandles = result.dataHandles ?? [];
+      if (driverResult.outputs.some((o) => o.kind === "pending")) {
+        throw new Error(
+          "Raw driver unexpectedly produced pending outputs — " +
+            "this is a bug; raw driver should only produce persisted outputs",
+        );
+      }
+      currentHandles = await processDriverOutputs(driverResult.outputs);
+      result = {
+        dataHandles: currentHandles,
+        followUpActions: driverResult
+          .followUpActions as FollowUpAction[] | undefined,
+      };
+      // Use the driver's context with writers for follow-up actions
+      executionContext = driver.contextWithWriters ?? context;
+    } else {
+      // Look up a registered driver type
+      const driverInfo = driverTypeRegistry.get(driverType);
+      if (!driverInfo) {
+        throw new Error(
+          `Unknown execution driver '${driverType}'. ` +
+            `Available drivers: ${
+              driverTypeRegistry.getAll().map((d) => d.type).join(", ")
+            }`,
+        );
+      }
+      if (!driverInfo.createDriver) {
+        throw new Error(
+          `Execution driver '${driverType}' does not have a createDriver factory.`,
+        );
+      }
+      const driver = driverInfo.createDriver(context.driverConfig ?? {});
+      const driverResult = await driver.execute(executionRequest, {
+        onLog: (line) => context.logger?.info(line),
+      });
+
+      if (driverResult.status === "error") {
+        throw new Error(driverResult.error ?? "Driver execution failed");
+      }
+
+      const resources = modelDef.resources ?? {};
+      const files = modelDef.files ?? {};
+      currentHandles = await processDriverOutputs(driverResult.outputs, {
+        dataRepository: context.dataRepository,
+        modelType: context.modelType,
+        modelId: context.modelId,
+        resources,
+        files,
+        tagOverrides: context.tagOverrides,
+        definitionTags: currentDefinition.tags,
+        runtimeTags: context.runtimeTags,
+        definitionName: currentDefinition.name,
+        vaultService: context.vaultService,
+        methodName,
+      });
+      result = { dataHandles: currentHandles };
+    }
 
     // Collect artifact refs from handles (data is already persisted)
     const storedArtifacts: DataArtifactRef[] = currentHandles.map((h) => ({
@@ -530,7 +686,7 @@ export class DefaultMethodExecutionService implements MethodExecutionService {
       const finalResult = await this.processFollowUpActions(
         currentDefinition,
         modelDef,
-        contextWithWriters,
+        executionContext,
         result.followUpActions,
         currentHandles,
         0,

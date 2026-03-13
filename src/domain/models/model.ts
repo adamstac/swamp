@@ -228,6 +228,17 @@ export interface MethodContext {
   redactor?: SecretRedactor;
 
   /**
+   * The execution driver type for this execution.
+   * Defaults to "raw" (in-process) when not specified.
+   */
+  driver?: string;
+
+  /**
+   * Configuration for the execution driver.
+   */
+  driverConfig?: Record<string, unknown>;
+
+  /**
    * Tags merged into every writer created during execution.
    * Used by workflow steps to inject workflow-specific tags.
    */
@@ -560,6 +571,13 @@ export interface ModelDefinition<
    * The last entry's `toVersion` must equal `version`.
    */
   upgrades?: VersionUpgrade[];
+
+  /**
+   * Pre-compiled self-contained bundle source (JS) for out-of-process execution.
+   * Set by UserModelLoader at load time. Includes all dependencies inlined
+   * (including zod) so it can run without network access inside containers.
+   */
+  bundleSource?: string;
 }
 
 /**
