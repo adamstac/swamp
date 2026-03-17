@@ -379,6 +379,36 @@ async function listFiles(dir: string): Promise<string[]> {
 }
 
 /**
+ * Recursively validates that no symlink under `path` resolves to a target
+ * outside `resolvedTmpDir`. Throws a UserError if a symlink escapes.
+ */
+/**
+ * Recursively validates that no symlink under `path` resolves to a target
+ * outside `resolvedTmpDir`. Throws a UserError if a symlink escapes.
+ */
+async function validateNoSymlinkEscape(
+  path: string,
+  resolvedTmpDir: string,
+): Promise<void> {
+  const stat = await Deno.lstat(path);
+  if (stat.isSymlink) {
+    // Resolve the symlink target relative to its parent directory so relative
+    // links like "../../etc/passwd" are caught even if the target doesn't exist.
+    const linkTarget = await Deno.readLink(path);
+    const resolvedTarget = resolve(join(path, "..", linkTarget));
+    if (!resolvedTarget.startsWith(resolvedTmpDir + "/")) {
+      throw new UserError(
+        `Archive contains a symlink that escapes the temp directory: ${path}`,
+      );
+    }
+  } else if (stat.isDirectory) {
+    for await (const entry of Deno.readDir(path)) {
+      await validateNoSymlinkEscape(join(path, entry.name), resolvedTmpDir);
+    }
+  }
+}
+
+/**
  * Detects files that already exist at target paths.
  */
 export async function detectConflicts(
@@ -590,6 +620,30 @@ export async function installExtension(
     const archivePath = join(tmpDir, "extension.tar.gz");
     await Deno.writeFile(archivePath, archiveBytes);
 
+    // Guard against path traversal BEFORE extraction: list archive entries and
+    // reject any that contain ".." or start with "/" which could escape tmpDir.
+    const listCommand = new Deno.Command("tar", {
+      args: ["-tzf", archivePath],
+      stdout: "piped",
+      stderr: "piped",
+    });
+    const listOutput = await listCommand.output();
+    if (!listOutput.success) {
+      const stderr = new TextDecoder().decode(listOutput.stderr);
+      throw new UserError(`Failed to list archive contents: ${stderr}`);
+    }
+    const archiveEntries = new TextDecoder()
+      .decode(listOutput.stdout)
+      .split("\n")
+      .filter((e) => e.length > 0);
+    for (const entry of archiveEntries) {
+      if (entry.includes("..") || entry.startsWith("/")) {
+        throw new UserError(
+          `Archive contains unsafe path: ${entry}`,
+        );
+      }
+    }
+
     // Extract using tar
     // COPYFILE_DISABLE prevents macOS tar from creating ._ resource fork files
     const tarCommand = new Deno.Command("tar", {
@@ -607,9 +661,18 @@ export async function installExtension(
     const extractDir = join(tmpDir, "extension");
 
     // Log extracted files for debugging
-    const allExtractedFiles = await listFiles(extractDir);
-    for (const f of allExtractedFiles) {
-      logger.debug`Archive contains: ${relative(extractDir, f)}`;
+    for (const entry of archiveEntries) {
+      logger.debug`Archive contains: ${entry}`;
+    }
+
+    // Guard against symlink path traversal: scan extracted directory for any
+    // symlinks whose resolved target escapes tmpDir.
+    const resolvedTmpDir = resolve(tmpDir);
+    for await (const entry of Deno.readDir(extractDir)) {
+      await validateNoSymlinkEscape(
+        join(extractDir, entry.name),
+        resolvedTmpDir,
+      );
     }
 
     // Parse manifest
