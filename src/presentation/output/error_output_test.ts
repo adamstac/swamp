@@ -19,7 +19,7 @@
 
 import { assertEquals, assertStringIncludes } from "@std/assert";
 import { initializeLogging } from "../../infrastructure/logging/logger.ts";
-import { renderError } from "./error_output.ts";
+import { buildErrorJson, renderError } from "./error_output.ts";
 import { UserError } from "../../domain/errors.ts";
 
 await initializeLogging({});
@@ -106,4 +106,88 @@ Deno.test("renderError uses fatal level for all errors", () => {
   } finally {
     console.error = originalError;
   }
+});
+
+// ============================================================================
+// JSON stdout output tests
+// ============================================================================
+
+Deno.test("renderError: json mode writes error JSON to stdout", () => {
+  const stdoutLogs: string[] = [];
+  const stderrLogs: string[] = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args: unknown[]) => stdoutLogs.push(args.join(" "));
+  console.error = (...args: unknown[]) => stderrLogs.push(args.join(" "));
+
+  try {
+    renderError(new UserError("Model not found"), "json");
+
+    assertEquals(stdoutLogs.length, 1);
+    const parsed = JSON.parse(stdoutLogs[0]);
+    assertEquals(parsed.error, "Model not found");
+    assertEquals(parsed.stack, undefined);
+    // stderr should also get the error (via LogTape)
+    assertEquals(stderrLogs.length, 1);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+});
+
+Deno.test("renderError: log mode does not write to stdout", () => {
+  const stdoutLogs: string[] = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args: unknown[]) => stdoutLogs.push(args.join(" "));
+  console.error = () => {};
+
+  try {
+    renderError(new UserError("Model not found"), "log");
+
+    assertEquals(stdoutLogs.length, 0);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+});
+
+Deno.test("renderError: no outputMode does not write to stdout", () => {
+  const stdoutLogs: string[] = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args: unknown[]) => stdoutLogs.push(args.join(" "));
+  console.error = () => {};
+
+  try {
+    renderError(new UserError("Model not found"));
+
+    assertEquals(stdoutLogs.length, 0);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+});
+
+// ============================================================================
+// buildErrorJson tests
+// ============================================================================
+
+Deno.test("buildErrorJson: UserError produces error-only JSON", () => {
+  const result = buildErrorJson(new UserError("Not found"));
+  assertEquals(result.error, "Not found");
+  assertEquals(result.stack, undefined);
+});
+
+Deno.test("buildErrorJson: system Error includes stack", () => {
+  const result = buildErrorJson(new Error("Something broke"));
+  assertEquals(result.error, "Something broke");
+  assertEquals(typeof result.stack, "string");
+  assertStringIncludes(result.stack!, "at ");
+});
+
+Deno.test("buildErrorJson: Cliffy missing arg error has no stack", () => {
+  const result = buildErrorJson(new Error("Missing argument(s): extension"));
+  assertEquals(result.error, "Missing argument(s): extension");
+  assertEquals(result.stack, undefined);
 });

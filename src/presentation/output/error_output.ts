@@ -19,6 +19,7 @@
 
 import { getSwampLogger } from "../../infrastructure/logging/logger.ts";
 import { UserError } from "../../domain/errors.ts";
+import type { OutputMode } from "./output.ts";
 
 const logger = getSwampLogger(["error"]);
 
@@ -32,12 +33,40 @@ function isCliffyMissingArgError(err: Error): boolean {
 }
 
 /**
+ * Builds the JSON error object for structured output.
+ * Format: { error: string, stack?: string }
+ * Matches the format used by createJsonErrorSink in the logging layer.
+ */
+export function buildErrorJson(err: Error): Record<string, string> {
+  const data: Record<string, string> = { error: err.message };
+  if (
+    !(err instanceof UserError) && !isCliffyMissingArgError(err) && err.stack
+  ) {
+    const stackLines = err.stack.split("\n").filter((line) =>
+      line.trim().startsWith("at ")
+    );
+    if (stackLines.length > 0) {
+      data.stack = stackLines.join("\n");
+    }
+  }
+  return data;
+}
+
+/**
  * Renders an error via LogTape at fatal level.
  * UserError instances and Cliffy missing-argument errors log just the message (no stack trace).
  * Other errors log the full Error object (including stack trace via Deno.inspect).
+ *
+ * In JSON mode, also writes the error as JSON to stdout so pipe consumers
+ * (jq, AI agents) see the failure instead of receiving empty stdout.
  */
-export function renderError(error: unknown): void {
+export function renderError(error: unknown, outputMode?: OutputMode): void {
   const err = error instanceof Error ? error : new Error(String(error));
+
+  if (outputMode === "json") {
+    // deno-lint-ignore no-console
+    console.log(JSON.stringify(buildErrorJson(err), null, 2));
+  }
 
   if (err instanceof UserError || isCliffyMissingArgError(err)) {
     logger.fatal("Error: {message}", { message: err.message });

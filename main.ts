@@ -34,10 +34,11 @@ if (import.meta.main) {
   } catch (error) {
     // Release datastore lock if still held (safety net for uncaught errors)
     await flushDatastoreSync();
+    const outputMode = getOutputModeFromArgs(Deno.args);
     await initializeLogging({
-      jsonMode: getOutputModeFromArgs(Deno.args) === "json",
+      jsonMode: outputMode === "json",
     });
-    renderError(error);
+    renderError(error, outputMode);
     Deno.exit(1);
   } finally {
     await shutdownTracing();
