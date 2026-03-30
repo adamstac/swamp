@@ -114,6 +114,10 @@ Deno.test("methodSummaryReport: succeeded method with data handles shows narrati
   assertEquals(items[0].name, "output.json");
   assertEquals(items[0].kind, "file");
   assertEquals(items[0].specName, "output");
+  assertEquals(
+    items[0].retrievalCommand,
+    "swamp data get my-server output.json --version 1",
+  );
 });
 
 Deno.test("methodSummaryReport: failed method status", async () => {
@@ -394,6 +398,6 @@ Deno.test("methodSummaryReport: JSON output structure matches expected shape", a
   assertEquals(items.length, 1);
   assertEquals(
     Object.keys(items[0]).sort(),
-    ["kind", "name", "specName", "version"],
+    ["kind", "name", "retrievalCommand", "specName", "version"],
   );
 });
