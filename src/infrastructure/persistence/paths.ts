@@ -32,6 +32,9 @@ export const SWAMP_DATA_DIR = ".swamp";
 /** The marker file name for initialized repositories */
 export const SWAMP_MARKER_FILE = ".swamp.yaml";
 
+/** The sources file name for local extension sources */
+export const SWAMP_SOURCES_FILE = ".swamp-sources.yaml";
+
 /**
  * Subdirectory names within the .swamp directory.
  */
@@ -115,6 +118,40 @@ export function swampPath(repoDir: string, ...segments: string[]): string {
  */
 export function swampMarkerPath(repoDir: string): string {
   return join(repoDir, SWAMP_MARKER_FILE);
+}
+
+/**
+ * Constructs the path to the extension sources file.
+ *
+ * @param repoDir - The repository root directory
+ * @returns The full path to .swamp-sources.yaml
+ */
+export function swampSourcesPath(repoDir: string): string {
+  return join(repoDir, SWAMP_SOURCES_FILE);
+}
+
+/**
+ * Creates a short, stable hash for namespacing bundle cache directories.
+ *
+ * Uses the **relative** path from `repoDir` to `baseDir` as the hash input
+ * rather than the absolute path. This ensures consistency across processes
+ * even when the repo path resolves differently due to filesystem symlinks
+ * (e.g., macOS `/var` → `/private/var`). Since both paths share the same
+ * prefix within a process, `relative()` cancels it out.
+ *
+ * @param baseDir - The extension source directory (absolute)
+ * @param repoDir - The repository root directory (absolute)
+ * @returns An 8-character hex hash string
+ */
+export function bundleNamespace(baseDir: string, repoDir: string): string {
+  const rel = relative(repoDir, baseDir);
+  // FNV-1a hash
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < rel.length; i++) {
+    hash ^= rel.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
 /**

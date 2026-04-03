@@ -51,12 +51,20 @@ import type {
 } from "../../infrastructure/persistence/extension_catalog_store.ts";
 import type { DenoRuntime } from "../runtime/deno_runtime.ts";
 import {
+  bundleNamespace,
   SWAMP_DATA_DIR,
   SWAMP_SUBDIRS,
 } from "../../infrastructure/persistence/paths.ts";
 import { assertSafePath } from "../../infrastructure/persistence/safe_path.ts";
 
 const logger = getLogger(["swamp", "models", "loader"]);
+
+/**
+ * Bundle layout version. Stored in the catalog's bundle_meta table.
+ * When this doesn't match, the catalog is invalidated to force a full
+ * rescan — migrating from flat to namespaced bundle paths.
+ */
+const BUNDLE_LAYOUT_VERSION = "namespaced-v1";
 
 /**
  * Plain object result returned by user methods before conversion.
@@ -342,7 +350,7 @@ export class UserModelLoader {
           denoPath,
           baseDir,
         );
-        const module = await this.importBundle(js, file);
+        const module = await this.importBundle(js, file, baseDir);
 
         if (module.model) {
           modelFiles.push({ file, module, absolutePath });
@@ -447,6 +455,18 @@ export class UserModelLoader {
     installZodGlobal();
     const denoPath = await this.denoRuntime.ensureDeno();
 
+    // Force a full rescan if the bundle layout version has changed.
+    // This ensures repos with old flat-layout catalog entries get migrated
+    // to the namespaced layout, fixing any #1065 cache poisoning.
+    if (
+      catalog.isPopulated("model") &&
+      catalog.getLayoutVersion() !== BUNDLE_LAYOUT_VERSION
+    ) {
+      logger
+        .warn`Bundle layout changed — invalidating catalog for full rescan`;
+      catalog.invalidate("model");
+    }
+
     // If catalog is already populated, register lazy entries from it
     // and do a lightweight mtime check for staleness.
     if (catalog.isPopulated("model")) {
@@ -498,8 +518,66 @@ export class UserModelLoader {
       options?.additionalDirs,
     );
     catalog.markPopulated("model");
+    catalog.setLayoutVersion(BUNDLE_LAYOUT_VERSION);
+
+    // Migrate old flat-layout bundle files into namespaced subdirectories.
+    if (this.repoDir) {
+      this.migrateOldFlatBundles(options?.additionalDirs);
+    }
 
     return fullResult;
+  }
+
+  /**
+   * Migrates old flat-layout bundle files into namespaced subdirectories.
+   * The old layout stored bundles at `.swamp/bundles/foo.js`. The new layout
+   * uses `.swamp/bundles/<hash>/foo.js`. Moving (not deleting) preserves
+   * pre-built bundles from pulled extensions that can't be rebundled locally.
+   *
+   * @param additionalDirs - The additional directories (sources + pulled)
+   *   used to determine which hash namespace to move flat files into.
+   *   Falls back to a "_migrated" namespace if no pulled dir is available.
+   */
+  private migrateOldFlatBundles(additionalDirs?: string[]): void {
+    if (!this.repoDir) return;
+    const bundlesDir = join(
+      this.repoDir,
+      SWAMP_DATA_DIR,
+      SWAMP_SUBDIRS.bundles,
+    );
+
+    // Determine target namespace: use the pulled models dir if available,
+    // otherwise use a fixed migration namespace.
+    const pulledDir = additionalDirs?.find((d) =>
+      d.includes("pulled-extensions")
+    );
+    const targetNs = pulledDir
+      ? bundleNamespace(pulledDir, this.repoDir)
+      : "_migrated";
+
+    try {
+      let migrated = 0;
+      for (const entry of Deno.readDirSync(bundlesDir)) {
+        if (entry.isFile && entry.name.endsWith(".js")) {
+          const srcPath = join(bundlesDir, entry.name);
+          const destDir = join(bundlesDir, targetNs);
+          const destPath = join(destDir, entry.name);
+          try {
+            Deno.mkdirSync(destDir, { recursive: true });
+            Deno.renameSync(srcPath, destPath);
+            migrated++;
+          } catch {
+            // Best-effort — if move fails, leave the flat file
+          }
+        }
+      }
+      if (migrated > 0) {
+        logger
+          .warn`Migrated ${migrated} bundle file(s) to namespaced layout`;
+      }
+    } catch {
+      // Bundles directory doesn't exist — nothing to migrate
+    }
   }
 
   /**
@@ -667,10 +745,12 @@ export class UserModelLoader {
     catalog: ExtensionCatalogStore,
   ): void {
     const files = this.discoverFilesSync(dir);
+    const ns = this.repoDir ? bundleNamespace(dir, this.repoDir) : "";
     for (const relativePath of files) {
       const absolutePath = resolve(dir, relativePath);
       const bundlePath = join(
         bundleBaseDir,
+        ns,
         relativePath.replace(/\.ts$/, ".js"),
       );
 
@@ -841,7 +921,7 @@ export class UserModelLoader {
       denoPath,
       baseDir,
     );
-    const module = await this.importBundle(js, relativePath);
+    const module = await this.importBundle(js, relativePath, baseDir);
 
     const stat = await Deno.stat(absolutePath);
     const sourceMtime = stat.mtime?.toISOString() ?? "";
@@ -852,7 +932,7 @@ export class UserModelLoader {
         throw new Error(formatUserModelError(parsed.error));
       }
       const typeNormalized = ModelType.create(parsed.data.type).normalized;
-      const bundlePath = this.getBundlePath(relativePath);
+      const bundlePath = this.getBundlePath(relativePath, baseDir);
 
       catalog.upsert({
         type_normalized: typeNormalized,
@@ -890,7 +970,7 @@ export class UserModelLoader {
         throw new Error(parsed.error.message);
       }
       const typeNormalized = ModelType.create(parsed.data.type).normalized;
-      const bundlePath = this.getBundlePath(relativePath);
+      const bundlePath = this.getBundlePath(relativePath, baseDir);
 
       catalog.upsert({
         type_normalized: typeNormalized,
@@ -906,16 +986,47 @@ export class UserModelLoader {
   }
 
   /**
-   * Returns the bundle cache path for a relative source path.
+   * Returns the bundle cache path for a relative source path, namespaced
+   * by a hash of the base directory to prevent collisions between sources.
    */
-  private getBundlePath(relativePath: string): string {
+  private getBundlePath(relativePath: string, baseDir: string): string {
     if (!this.repoDir) return "";
     return join(
       this.repoDir,
       SWAMP_DATA_DIR,
       SWAMP_SUBDIRS.bundles,
+      bundleNamespace(baseDir, this.repoDir),
       relativePath.replace(/\.ts$/, ".js"),
     );
+  }
+
+  /**
+   * Walks up from a source file to find the nearest deno.json or deno.jsonc.
+   * Returns the absolute path to the config file, or undefined if none found.
+   * Stops at the filesystem root or at the consumer repo root to avoid
+   * picking up an unrelated project's config.
+   */
+  private findNearestDenoConfig(absolutePath: string): string | undefined {
+    let dir = dirname(absolutePath);
+    const root = resolve("/");
+    while (dir !== root) {
+      // Stop at the consumer repo boundary
+      if (this.repoDir && resolve(dir) === resolve(this.repoDir)) break;
+
+      for (const name of ["deno.json", "deno.jsonc"]) {
+        const candidate = join(dir, name);
+        try {
+          Deno.statSync(candidate);
+          return candidate;
+        } catch {
+          // Not found — keep walking up
+        }
+      }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return undefined;
   }
 
   /**
@@ -933,6 +1044,7 @@ export class UserModelLoader {
         this.repoDir,
         SWAMP_DATA_DIR,
         SWAMP_SUBDIRS.bundles,
+        bundleNamespace(boundaryDir, this.repoDir),
         relativePath.replace(/\.ts$/, ".js"),
       );
 
@@ -974,7 +1086,17 @@ export class UserModelLoader {
       // to the cache. The old bundle file is untouched on failure since
       // bundleExtension returns the JS string in memory before we write.
       try {
-        const js = await bundleExtension(absolutePath, denoPath);
+        // Discover the nearest deno.json for import map resolution.
+        // This is essential for source extensions that live in a separate
+        // directory tree with their own deno.json.
+        const denoConfigPath = this.findNearestDenoConfig(absolutePath);
+        if (denoConfigPath) {
+          logger
+            .warn`Using discovered deno config for ${relativePath}: ${denoConfigPath}`;
+        }
+        const js = await bundleExtension(absolutePath, denoPath, {
+          denoConfigPath,
+        });
         const bundleBoundary = join(this.repoDir, SWAMP_DATA_DIR);
         await assertSafePath(bundlePath, bundleBoundary);
         await Deno.mkdir(dirname(bundlePath), { recursive: true });
@@ -1003,7 +1125,12 @@ export class UserModelLoader {
     }
 
     // No repo dir — just bundle without caching
-    return await bundleExtension(absolutePath, denoPath);
+    const denoConfigPath = this.findNearestDenoConfig(absolutePath);
+    if (denoConfigPath) {
+      logger
+        .warn`Using discovered deno config for ${absolutePath}: ${denoConfigPath}`;
+    }
+    return await bundleExtension(absolutePath, denoPath, { denoConfigPath });
   }
 
   /**
@@ -1013,17 +1140,22 @@ export class UserModelLoader {
   private async importBundle(
     js: string,
     relativePath: string,
+    baseDir?: string,
   ): Promise<Record<string, unknown>> {
     // Rewrite zod imports and fix CJS/ESM interop at import-time — catches
     // old cached bundles. Both rewrites are idempotent.
     const rewritten = fixCjsEsmInterop(rewriteZodImports(js));
 
     if (this.repoDir) {
+      const ns = baseDir ? bundleNamespace(baseDir, this.repoDir) : "";
+      const segments = ns
+        ? [ns, relativePath.replace(/\.ts$/, ".js")]
+        : [relativePath.replace(/\.ts$/, ".js")];
       const bundlePath = join(
         this.repoDir,
         SWAMP_DATA_DIR,
         SWAMP_SUBDIRS.bundles,
-        relativePath.replace(/\.ts$/, ".js"),
+        ...segments,
       );
 
       try {
