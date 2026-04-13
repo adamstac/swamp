@@ -348,8 +348,37 @@ export class CelEvaluator {
       const wrappedContext = this.wrapNamespaces(context);
 
       const result = this.env.evaluate(transformedExpr, wrappedContext);
+
+      // Detect unresolved Promises from async CEL functions (data.latest,
+      // data.findByTag, data.findBySpec, data.query).  These functions are
+      // async but the sync evaluate path cannot await them, so the raw
+      // Promise leaks through.  Catch it here — before coerceBigInts
+      // silently converts the Promise to {} — and throw a clear error.
+      if (result instanceof Promise) {
+        // Suppress the dangling rejection — the async operation is still
+        // in flight but we are about to throw synchronously.  Without
+        // this, the eventual rejection surfaces as an unhandled promise
+        // rejection in the runtime.
+        result.catch(() => {});
+
+        throw new InvalidExpressionError(
+          "Expression returned an unresolved Promise. " +
+            "Async CEL functions (data.latest, data.findByTag, " +
+            "data.findBySpec, data.query) cannot be used in " +
+            "synchronously-evaluated contexts like forEach.in. " +
+            "Move the async call into a parent workflow's task.inputs " +
+            "(which IS awaited) and pass the resolved value to a child " +
+            "workflow. See: .claude/skills/swamp-workflow/references/" +
+            "nested-workflows.md#when-to-use-nested-workflows",
+          expression,
+        );
+      }
+
       return coerceBigInts(result);
     } catch (error) {
+      // Re-throw InvalidExpressionError directly to avoid double-wrapping
+      // (the Promise detection above already throws this type).
+      if (error instanceof InvalidExpressionError) throw error;
       throw new InvalidExpressionError(
         error instanceof Error ? error.message : String(error),
         expression,
