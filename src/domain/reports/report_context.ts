@@ -22,6 +22,7 @@ import type { ModelType } from "../models/model_type.ts";
 import type { DataHandle } from "../models/model.ts";
 import type { UnifiedDataRepository } from "../../infrastructure/persistence/unified_data_repository.ts";
 import type { DefinitionRepository } from "../definitions/repositories.ts";
+import { resolveExtensionFile } from "../extensions/extension_file_resolver.ts";
 
 /**
  * Base fields shared by all report contexts.
@@ -81,6 +82,14 @@ export interface MethodReportContext extends BaseReportContext {
   dataHandles: DataHandle[];
   /** Output spec schemas from the model type definition. */
   outputSpecs?: OutputSpecInfo[];
+  /**
+   * Resolve a path to an asset declared in the extension's
+   * `additionalFiles` manifest field. Same semantics as
+   * `MethodContext.extensionFile`. Always populated by
+   * `buildMethodReportContext`; throws a typed `UserError` at call time
+   * when the model is not shipped via an extension manifest.
+   */
+  extensionFile: (relPath: string) => string;
 }
 
 /**
@@ -168,6 +177,7 @@ export interface MethodReportInvocation {
   errorMessage?: string;
   dataHandles: DataHandle[];
   outputSpecs?: OutputSpecInfo[];
+  extensionFilesRoot?: string;
 }
 
 /**
@@ -182,6 +192,7 @@ export function buildMethodReportContext(
   common: CommonReportContextDeps,
   invocation: MethodReportInvocation,
 ): MethodReportContext {
+  const root = invocation.extensionFilesRoot;
   return {
     scope: "method",
     repoDir: common.repoDir,
@@ -199,5 +210,6 @@ export function buildMethodReportContext(
     errorMessage: invocation.errorMessage,
     dataHandles: invocation.dataHandles,
     outputSpecs: invocation.outputSpecs,
+    extensionFile: (relPath: string) => resolveExtensionFile(root, relPath),
   };
 }
