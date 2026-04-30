@@ -17,10 +17,14 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with Swamp.  If not, see <https://www.gnu.org/licenses/>.
 
-import { getLogger } from "@logtape/logtape";
-import { Workflow, type WorkflowInput } from "./workflow.ts";
+import type { Workflow } from "./workflow.ts";
 import type { Job } from "./job.ts";
 import type { Step } from "./step.ts";
+import {
+  type ExpandedStep,
+  ForEachExpansionService,
+} from "./for_each_expansion_service.ts";
+import { coerceToSuffix } from "./data_suffix.ts";
 // deno-lint-ignore verbatim-module-syntax
 import { JobRun, WorkflowRun } from "./workflow_run.ts";
 import {
@@ -33,6 +37,10 @@ import type {
   WorkflowRunRepository,
 } from "./repositories.ts";
 import { YamlDefinitionRepository } from "../../infrastructure/persistence/yaml_definition_repository.ts";
+import type { DefinitionRepository } from "../definitions/repositories.ts";
+import type { OutputRepository } from "../models/repositories.ts";
+import type { UnifiedDataRepository } from "../../infrastructure/persistence/unified_data_repository.ts";
+import type { MethodExecutionService } from "../models/method_execution_service.ts";
 import { YamlEvaluatedDefinitionRepository } from "../../infrastructure/persistence/yaml_evaluated_definition_repository.ts";
 import { YamlEvaluatedWorkflowRepository } from "../../infrastructure/persistence/yaml_evaluated_workflow_repository.ts";
 import { YamlOutputRepository } from "../../infrastructure/persistence/yaml_output_repository.ts";
@@ -40,30 +48,19 @@ import { FileSystemUnifiedDataRepository } from "../../infrastructure/persistenc
 import type { CatalogStore } from "../../infrastructure/persistence/catalog_store.ts";
 import { DataQueryService } from "../data/data_query_service.ts";
 import { resolveModelType } from "../extensions/extension_auto_resolver.ts";
-import { BUILTIN_METHOD_REPORTS } from "../reports/builtin/mod.ts";
+import { MethodReportRunner } from "./method_report_runner.ts";
 import { getAutoResolver } from "../extensions/auto_resolver_context.ts";
 import { DefaultMethodExecutionService } from "../models/method_execution_service.ts";
 import { DefaultModelValidationService } from "../models/validation_service.ts";
 import { buildMethodContext } from "../models/method_context.ts";
-import { buildOutputSpecs } from "../models/output_spec_builder.ts";
 import { detectEnvVarUsageInDefinition } from "../models/env_var_detector.ts";
-import type { Definition } from "../definitions/definition.ts";
 import { findDefinitionByIdOrName } from "../models/model_lookup.ts";
 import type { MethodExecutionEvent } from "../models/method_events.ts";
 import { ModelOutput } from "../models/model_output.ts";
-import {
-  extractExpressions,
-  isTaskInputsPath,
-  replaceExpressions,
-} from "../expressions/expression_parser.ts";
-import {
-  containsRuntimeExpression,
-  ExpressionEvaluationService,
-} from "../expressions/expression_evaluation_service.ts";
-import {
-  extractDependencies,
-  hasStepOutputDependency,
-} from "../expressions/dependency_extractor.ts";
+import type { Definition } from "../definitions/definition.ts";
+import type { ModelType } from "../models/model_type.ts";
+import type { MethodResult, ModelDefinition } from "../models/model.ts";
+import { ExpressionEvaluationService } from "../expressions/expression_evaluation_service.ts";
 import {
   buildEnvContext,
   type DataRecord,
@@ -72,6 +69,10 @@ import {
   ModelResolver,
 } from "../expressions/model_resolver.ts";
 import { CelEvaluator } from "../../infrastructure/cel/cel_evaluator.ts";
+import {
+  DefinitionExpressionEvaluator,
+  WorkflowExpressionEvaluator,
+} from "./expression_evaluators.ts";
 import { UserError } from "../errors.ts";
 import {
   getRunLogger,
@@ -86,37 +87,14 @@ import { SecretRedactor } from "../secrets/mod.ts";
 import { VaultService } from "../vaults/vault_service.ts";
 import { merge } from "../../infrastructure/stream/merge.ts";
 import { withEventBridge } from "../../infrastructure/stream/event_bridge.ts";
-import {
-  executeReports,
-  type ReportEventCallback,
-  type ReportFilterOptions,
-} from "../reports/report_execution_service.ts";
-import { reportRegistry } from "../reports/report_registry.ts";
-import { buildMethodReportContext } from "../reports/report_context.ts";
-import { modelRegistry } from "../models/model.ts";
+import type { ReportFilterOptions } from "../reports/report_execution_service.ts";
 import { getTracer, SpanStatusCode } from "../../infrastructure/tracing/mod.ts";
-import {
-  type DriverSource,
-  resolveDriverConfig,
-} from "../drivers/driver_resolution.ts";
+import { DriverPlan } from "../drivers/driver_plan.ts";
 import {
   type RepoMarkerData,
   RepoMarkerRepository,
 } from "../../infrastructure/persistence/repo_marker_repository.ts";
 import { createRepoMarkerLoader } from "../../infrastructure/persistence/repo_marker_loader.ts";
-
-/**
- * Driver-resolution tiers available at step-construction time. The
- * `definition` tier is omitted here because it requires the evaluated
- * definition, which is only available inside the step executor.
- */
-export interface DriverTiers {
-  cli?: DriverSource;
-  step?: DriverSource;
-  job?: DriverSource;
-  workflow?: DriverSource;
-  repo?: DriverSource;
-}
 
 /**
  * Context for step execution.
@@ -138,8 +116,18 @@ export interface StepExecutionContext {
   step?: Step;
   /** Callback to emit events into the parent event stream */
   emitEvent?: (event: WorkflowExecutionEvent) => void;
-  /** When true, load previously-evaluated definitions instead of evaluating CEL */
-  useLastEvaluated?: boolean;
+  /**
+   * Evaluation mode for the step:
+   * - `"fresh"` (default): evaluate CEL expressions against the current
+   *   expression context, then cache the evaluated definition.
+   * - `"lastEvaluated"`: skip CEL evaluation; load the previously-cached
+   *   evaluated definition. Used when `--last-evaluated` is passed at
+   *   the CLI to re-run a workflow without re-evaluating expressions.
+   *
+   * Both modes still require `expressionContext` because runtime
+   * expressions (vault, env) and step-output tracking need it.
+   */
+  mode?: "fresh" | "lastEvaluated";
   /** forEach iteration variable (e.g., { env: "dev" } for self.env) */
   forEachVariable?: { name: string; value: unknown };
   /** Tags from the workflow definition, merged into data writer tag overrides */
@@ -149,12 +137,12 @@ export interface StepExecutionContext {
   /** Secret redactor for stripping vault secrets from persisted data and logs */
   secretRedactor?: SecretRedactor;
   /**
-   * Unresolved driver tiers to merge with the `definition` tier inside
-   * the step executor. The `definition` tier can only be populated where
-   * the evaluated definition is in scope, so final resolution happens in
-   * `DefaultStepExecutor.executeModelMethod` rather than here.
+   * Two-stage driver-resolution plan. Pre-definition tiers
+   * (cli/step/job/workflow/repo) are filled in at step-construction
+   * time; the executor finalizes via `driverPlan.withDefinition({...})`
+   * once the evaluated definition is in scope.
    */
-  driverTiers?: DriverTiers;
+  driverPlan?: DriverPlan;
   /** Report filter options for per-step report execution */
   reportFilterOptions?: ReportFilterOptions;
   /** The git commit sha of the swamp repo at execution time */
@@ -169,17 +157,6 @@ export interface StepExecutionContext {
   dataBaseDir?: string;
   /** Catalog store for write-through indexing */
   catalogStore: CatalogStore;
-}
-
-/**
- * Represents an expanded step from a forEach iteration.
- */
-interface ExpandedStep {
-  step: Step;
-  /** The expanded step name after evaluating expressions */
-  expandedName: string;
-  /** The forEach variable name and value */
-  forEachVar: { name: string; value: unknown };
 }
 
 /**
@@ -202,10 +179,95 @@ export interface StepExecutor {
 const MAX_WORKFLOW_NESTING_DEPTH = 10;
 
 /**
+ * Infrastructure dependencies the {@link DefaultStepExecutor} needs to
+ * run a model method. Inject this for tests so the executor can be
+ * exercised without disk, real vaults, or YAML on the filesystem.
+ *
+ * In production, callers either build deps explicitly via
+ * {@link DefaultStepExecutor.fromRepoDir} or rely on the no-arg
+ * constructor's lazy per-call construction (today's behaviour).
+ */
+export interface StepExecutorDeps {
+  definitionRepo: DefinitionRepository;
+  unifiedDataRepo: UnifiedDataRepository;
+  dataQueryService: DataQueryService;
+  outputRepo: OutputRepository;
+  evaluatedDefRepo: YamlEvaluatedDefinitionRepository;
+  methodExecutionService: MethodExecutionService;
+  vaultService: VaultService;
+  expressionEvaluator: ExpressionEvaluationService;
+}
+
+/**
  * Default step executor that handles model methods and workflow invocations.
  */
 export class DefaultStepExecutor implements StepExecutor {
   private readonly validationService = new DefaultModelValidationService();
+  private readonly reportRunner = new MethodReportRunner();
+
+  constructor(private readonly injectedDeps?: StepExecutorDeps) {}
+
+  /**
+   * Build a fully-wired DefaultStepExecutor for production use. Performs
+   * the same construction the no-arg path does at execute() time, just
+   * once at the seam — so callers that have a repoDir at construction
+   * time can avoid per-call rebuild of repos and the vault service.
+   */
+  static async fromRepoDir(
+    repoDir: string,
+    opts: {
+      dataBaseDir?: string;
+      catalogStore: CatalogStore;
+    },
+  ): Promise<DefaultStepExecutor> {
+    return new DefaultStepExecutor(
+      await DefaultStepExecutor.buildDeps(repoDir, opts),
+    );
+  }
+
+  /**
+   * Construct deps either from the injected set (tests) or per-call
+   * from the StepExecutionContext (production no-arg path — today's
+   * behaviour preserved exactly).
+   */
+  private async resolveDeps(
+    ctx: StepExecutionContext,
+  ): Promise<StepExecutorDeps> {
+    if (this.injectedDeps) return this.injectedDeps;
+    return await DefaultStepExecutor.buildDeps(ctx.repoDir, {
+      dataBaseDir: ctx.dataBaseDir,
+      catalogStore: ctx.catalogStore,
+    });
+  }
+
+  private static async buildDeps(
+    repoDir: string,
+    opts: { dataBaseDir?: string; catalogStore: CatalogStore },
+  ): Promise<StepExecutorDeps> {
+    const definitionRepo = new YamlDefinitionRepository(repoDir);
+    const unifiedDataRepo = new FileSystemUnifiedDataRepository(
+      repoDir,
+      opts.dataBaseDir,
+      opts.catalogStore,
+    );
+    const dataQueryService = new DataQueryService(
+      opts.catalogStore,
+      unifiedDataRepo,
+    );
+    return {
+      definitionRepo,
+      unifiedDataRepo,
+      dataQueryService,
+      outputRepo: new YamlOutputRepository(repoDir),
+      evaluatedDefRepo: new YamlEvaluatedDefinitionRepository(repoDir),
+      methodExecutionService: new DefaultMethodExecutionService(),
+      vaultService: await VaultService.fromRepository(repoDir),
+      expressionEvaluator: new ExpressionEvaluationService(
+        definitionRepo,
+        repoDir,
+      ),
+    };
+  }
 
   async execute(step: Step, ctx: StepExecutionContext): Promise<unknown> {
     const task = step.task.data;
@@ -229,19 +291,16 @@ export class DefaultStepExecutor implements StepExecutor {
     },
     ctx: StepExecutionContext,
   ): Promise<unknown> {
-    const definitionRepo = new YamlDefinitionRepository(ctx.repoDir);
-    const unifiedDataRepo = new FileSystemUnifiedDataRepository(
-      ctx.repoDir,
-      ctx.dataBaseDir,
-      ctx.catalogStore,
-    );
-    const dataQueryService = new DataQueryService(
-      ctx.catalogStore,
+    const {
+      definitionRepo,
       unifiedDataRepo,
-    );
-    const outputRepo = new YamlOutputRepository(ctx.repoDir);
-    const executionService = new DefaultMethodExecutionService();
-    const vaultService = await VaultService.fromRepository(ctx.repoDir);
+      dataQueryService,
+      outputRepo,
+      evaluatedDefRepo,
+      methodExecutionService: executionService,
+      vaultService,
+      expressionEvaluator,
+    } = await this.resolveDeps(ctx);
 
     // Look up the model definition by ID or name
     const lookupResult = await findDefinitionByIdOrName(
@@ -310,12 +369,9 @@ export class DefaultStepExecutor implements StepExecutor {
     // Evaluate CEL expressions (vault left raw for persistence)
     let evaluatedDefinition = originalDefinition;
     let stepInputs: Record<string, unknown> = {};
-    if (ctx.useLastEvaluated) {
+    if (ctx.mode === "lastEvaluated") {
       // Load previously-evaluated definition from cache
       runLogger?.debug("Loading last evaluated definition");
-      const evaluatedDefRepo = new YamlEvaluatedDefinitionRepository(
-        ctx.repoDir,
-      );
       const lastEvaluated = await evaluatedDefRepo.findByName(
         modelType,
         originalDefinition.name,
@@ -351,12 +407,7 @@ export class DefaultStepExecutor implements StepExecutor {
 
       // Evaluate step task inputs and merge into context
       if (task.inputs) {
-        // Evaluate any expressions in the step task inputs
-        const evalService = new ExpressionEvaluationService(
-          new YamlDefinitionRepository(ctx.repoDir),
-          ctx.repoDir,
-        );
-        stepInputs = await evalService.evaluateData(
+        stepInputs = await expressionEvaluator.evaluateData(
           task.inputs,
           ctx.expressionContext,
         ) as Record<string, unknown>;
@@ -366,11 +417,9 @@ export class DefaultStepExecutor implements StepExecutor {
       const originalInputs = ctx.expressionContext.inputs ?? {};
       ctx.expressionContext.inputs = { ...originalInputs, ...stepInputs };
 
-      evaluatedDefinition = await this.evaluateDefinitionExpressions(
-        originalDefinition,
-        ctx.expressionContext,
-        ctx.repoDir,
-      );
+      evaluatedDefinition = await new DefinitionExpressionEvaluator(
+        new CelEvaluator(),
+      ).evaluate(originalDefinition, ctx.expressionContext);
     }
 
     // Forward all step inputs as method arguments.
@@ -387,7 +436,6 @@ export class DefaultStepExecutor implements StepExecutor {
     }
 
     // Save evaluated definition (with vault expressions still raw) for --last-evaluated
-    const evaluatedDefRepo = new YamlEvaluatedDefinitionRepository(ctx.repoDir);
     await evaluatedDefRepo.save(modelType, evaluatedDefinition);
 
     // Capture pre-vault args for report context (so vault secrets stay as expressions)
@@ -398,11 +446,7 @@ export class DefaultStepExecutor implements StepExecutor {
 
     // Resolve runtime expressions (vault and env) at runtime (never persisted).
     // Vault secrets become sentinel tokens; the secretBag maps sentinels to raw values.
-    const evalService = new ExpressionEvaluationService(
-      new YamlDefinitionRepository(ctx.repoDir),
-      ctx.repoDir,
-    );
-    const runtimeResult = await evalService
+    const runtimeResult = await expressionEvaluator
       .resolveRuntimeExpressionsInDefinition(
         evaluatedDefinition,
         ctx.secretRedactor,
@@ -444,12 +488,10 @@ export class DefaultStepExecutor implements StepExecutor {
     }
     await outputRepo.save(modelType, task.methodName, output);
 
-    // Track data outputs for context refresh (specName → instanceName → record)
-    const resources: Record<string, Record<string, DataRecord>> = {};
-    const files: Record<string, Record<string, FileDataRecord>> = {};
-
     // Declared outside try so the catch block can record artifacts written
     // before a throw (e.g. model writes data then throws on verdict=FAIL).
+    // Each phase owns its mutations of this list; the orchestrator only
+    // creates and threads it.
     const savedArtifacts: Array<{
       dataId: string;
       name: string;
@@ -458,597 +500,542 @@ export class DefaultStepExecutor implements StepExecutor {
     }> = [];
 
     try {
-      runLogger.debug("Executing method {method}", {
-        method: task.methodName,
-      });
-      ctx.emitEvent?.({
-        kind: "method_executing",
-        jobId: ctx.jobName,
-        stepId: ctx.stepName,
-        modelName: originalDefinition.name,
-        methodName: task.methodName,
-      });
-
-      // Build workflow-specific tag overrides
-      // Use "source" instead of "type" to preserve the original data type
-      // (resource/file) while tracking provenance for cross-workflow resolution
-      const workflowTagOverrides: Record<string, string> = {
-        ...(ctx.workflowTags ?? {}),
-        source: "step-output",
-        workflow: ctx.workflowName,
-        workflowRunId: ctx.workflowRunId,
-        step: ctx.stepName,
-      };
-
-      // Convert step's dataOutputOverrides to the format expected by writer factories
-      const stepDataOutputOverrides = ctx.step?.dataOutputOverrides
-        ? Array.from(ctx.step.dataOutputOverrides).map((override) => {
-          let resolvedVarySuffix: string | undefined;
-          if (override.vary && override.vary.length > 0) {
-            const inputs = ctx.expressionContext?.inputs ?? {};
-            const varyValues = override.vary.map((key) => {
-              const val = inputs[key];
-              if (val === undefined || val === null) {
-                throw new UserError(
-                  `Vary dimension '${key}' not found in step inputs for spec '${override.specName}'`,
-                );
-              }
-              return coerceToSuffix(val);
-            });
-            resolvedVarySuffix = varyValues.join("-");
-          }
-          return {
-            specName: override.specName,
-            lifetime: override.lifetime,
-            garbageCollection: override.garbageCollection,
-            tags: override.tags,
-            resolvedVarySuffix,
-          };
-        })
-        : undefined;
-
-      // Resolve the final driver/driverConfig with all six tiers now that
-      // the evaluated definition is in scope. The pre-definition tiers
-      // (cli/step/job/workflow/repo) were captured at step-construction
-      // time; the definition tier slots in between workflow and repo.
-      const tiers = ctx.driverTiers;
-      const resolved = resolveDriverConfig(
-        tiers?.cli,
-        tiers?.step,
-        tiers?.job,
-        tiers?.workflow,
-        {
-          driver: evaluatedDefinition.driver,
-          driverConfig: evaluatedDefinition.driverConfig,
-        },
-        tiers?.repo,
-      );
-
-      // Execute the method with EVALUATED definition
-      // Logger handles both console and file persistence via RunFileSink
-      // Data is persisted by DataWriter during execution — no double-save
-      const result = await executionService.executeWorkflow(
-        evaluatedDefinition,
+      const result = await this.invokeMethod({
+        task,
+        ctx,
+        executionService,
+        unifiedDataRepo,
+        definitionRepo,
+        dataQueryService,
+        vaultService,
+        modelType,
         modelDef,
-        task.methodName,
-        buildMethodContext(
-          {
-            dataRepository: unifiedDataRepo,
-            definitionRepository: definitionRepo,
-            vaultService,
-            redactor: ctx.secretRedactor,
-            dataQueryService,
-          },
-          {
-            signal: ctx.signal,
-            repoDir: ctx.repoDir,
-            modelType,
-            modelId: evaluatedDefinition.id,
-            globalArgs: evaluatedDefinition.globalArguments,
-            definition: {
-              id: evaluatedDefinition.id,
-              name: evaluatedDefinition.name,
-              version: evaluatedDefinition.version,
-              tags: evaluatedDefinition.tags,
-            },
-            methodName: task.methodName,
-            logger: runLogger,
-            tagOverrides: workflowTagOverrides,
-            runtimeTags: ctx.runtimeTags,
-            dataOutputOverrides: stepDataOutputOverrides,
-            vaultSecrets: secretBag,
-            driver: resolved.driver,
-            driverConfig: resolved.driverConfig,
-            skipCheckNames: ctx.skipCheckNames,
-            skipCheckLabels: ctx.skipCheckLabels,
-            skipAllChecks: ctx.skipAllChecks,
-            extensionFilesRoot: modelDef.extensionFilesRoot,
-            onEvent: ctx.emitEvent
-              ? (event: MethodExecutionEvent) => {
-                if (event.type === "output") {
-                  ctx.emitEvent!({
-                    kind: "method_output",
-                    jobId: ctx.jobName,
-                    stepId: ctx.stepName,
-                    modelName: originalDefinition.name,
-                    methodName: task.methodName,
-                    stream: event.stream,
-                    line: event.line,
-                  });
-                } else {
-                  ctx.emitEvent!({
-                    kind: "method_event",
-                    jobId: ctx.jobName,
-                    stepId: ctx.stepName,
-                    modelName: originalDefinition.name,
-                    methodName: task.methodName,
-                    event,
-                  });
-                }
-              }
-              : undefined,
-          },
-        ),
-      );
-
-      // Extract artifact info from dataHandles (already persisted by DataWriter)
-      if (result.dataHandles && result.dataHandles.length > 0) {
-        for (const handle of result.dataHandles) {
-          const artifactRef = {
-            dataId: handle.dataId,
-            name: handle.name,
-            version: handle.version,
-            tags: handle.tags,
-          };
-          output.addDataArtifact(artifactRef);
-          savedArtifacts.push(artifactRef);
-
-          const dataPath = unifiedDataRepo.getPath(
-            modelType,
-            evaluatedDefinition.id,
-            handle.name,
-            handle.version,
-          );
-          runLogger.debug("Data saved to {path}", { path: dataPath });
-
-          // Build context data from handles (nested under specName → instanceName)
-          if (handle.kind === "resource") {
-            let attributes: Record<string, unknown> = {};
-            if (handle.metadata.contentType === "application/json") {
-              try {
-                const content = await unifiedDataRepo.getContent(
-                  modelType,
-                  evaluatedDefinition.id,
-                  handle.name,
-                  handle.version,
-                );
-                if (content) {
-                  const text = new TextDecoder().decode(content);
-                  attributes = JSON.parse(text) as Record<string, unknown>;
-                }
-              } catch {
-                // Not valid JSON, skip attributes
-              }
-            }
-            if (!resources[handle.specName]) {
-              resources[handle.specName] = {};
-            }
-            resources[handle.specName][handle.name] = {
-              id: handle.dataId,
-              name: handle.name,
-              version: handle.version,
-              // The resource was just saved by the current step, so this
-              // record is authoritative for the data item.
-              isLatest: true,
-              createdAt: new Date().toISOString(),
-              attributes,
-              tags: handle.tags,
-              modelName: handle.tags["modelName"] ?? evaluatedDefinition.name,
-              modelType: modelType.normalized,
-              specName: handle.specName,
-              dataType: handle.tags["type"] ?? "resource",
-              contentType: handle.metadata.contentType,
-              lifetime: handle.metadata.lifetime,
-              ownerType: handle.metadata.ownerDefinition.ownerType,
-              streaming: handle.metadata.streaming,
-              size: handle.size,
-              content: "",
-              ownerRef: handle.metadata.ownerDefinition.ownerRef,
-              workflowRunId: handle.metadata.ownerDefinition.workflowRunId ??
-                "",
-              workflowName: handle.metadata.ownerDefinition.workflowName ?? "",
-              jobName: handle.metadata.ownerDefinition.jobName ?? "",
-              stepName: handle.metadata.ownerDefinition.stepName ?? "",
-              source: handle.metadata.ownerDefinition.source ?? "",
-            };
-          } else if (handle.kind === "file") {
-            const contentPath = unifiedDataRepo.getContentPath(
-              modelType,
-              evaluatedDefinition.id,
-              handle.name,
-              handle.version,
-            );
-            try {
-              const stat = await Deno.stat(contentPath);
-              if (!files[handle.specName]) files[handle.specName] = {};
-              files[handle.specName][handle.name] = {
-                id: handle.dataId,
-                version: handle.version,
-                createdAt: new Date().toISOString(),
-                path: contentPath,
-                size: stat.size,
-                contentType: handle.metadata.contentType,
-              };
-            } catch {
-              // File not found, skip
-            }
-          }
-        }
-      }
-
-      // Mark output as succeeded and save
-      output.markSucceeded();
-      await outputRepo.save(modelType, task.methodName, output);
-
-      runLogger.with({ summary: true }).debug(
-        "Method {method} completed on {model}",
-        { method: task.methodName, model: originalDefinition.name },
-      );
-
-      // --- Per-step reports (method + model scope) ---
-      if (
-        reportRegistry.getAll().length > 0 && ctx.reportFilterOptions
-      ) {
-        const dataHandles = result.dataHandles ?? [];
-
-        // Compute vary suffix from forEach variable
-        let reportVarySuffix: string | undefined;
-        if (ctx.forEachVariable?.value !== undefined) {
-          reportVarySuffix = coerceToSuffix(ctx.forEachVariable.value);
-        }
-
-        const reportEventCallbacks: ReportEventCallback = {
-          onReportStarted: (name, scope) => {
-            ctx.emitEvent?.({
-              kind: "report_started",
-              reportName: name,
-              scope,
-              jobId: ctx.jobName,
-              stepId: ctx.stepName,
-            });
-          },
-          onReportCompleted: (
-            name,
-            scope,
-            markdown,
-            json,
-            reportDataHandles,
-          ) => {
-            ctx.emitEvent?.({
-              kind: "report_completed",
-              reportName: name,
-              scope,
-              markdown,
-              json,
-              jobId: ctx.jobName,
-              stepId: ctx.stepName,
-            });
-            // Track report data artifacts alongside method artifacts
-            for (const handle of reportDataHandles) {
-              output.addDataArtifact({
-                dataId: handle.dataId,
-                name: handle.name,
-                version: handle.version,
-                tags: handle.tags,
-              });
-              savedArtifacts.push({
-                dataId: handle.dataId,
-                name: handle.name,
-                version: handle.version,
-                tags: handle.tags,
-              });
-            }
-          },
-          onReportFailed: (name, scope, error) => {
-            ctx.emitEvent?.({
-              kind: "report_failed",
-              reportName: name,
-              scope,
-              error,
-              jobId: ctx.jobName,
-              stepId: ctx.stepName,
-            });
-          },
-        };
-
-        // Look up model-type defaults for report filtering
-        const stepModelDef = modelRegistry.get(modelType);
-        const stepModelTypeReports = [
-          ...BUILTIN_METHOD_REPORTS,
-          ...(stepModelDef?.reports ?? []),
-        ];
-
-        // Method-scope reports
-        const methodContext = buildMethodReportContext(
-          {
-            repoDir: ctx.repoDir,
-            logger: runLogger,
-            dataRepository: unifiedDataRepo,
-            definitionRepository: definitionRepo,
-            swampSha: ctx.swampSha,
-          },
-          {
-            modelType,
-            modelId: evaluatedDefinition.id,
-            definition: {
-              id: evaluatedDefinition.id,
-              name: evaluatedDefinition.name,
-              version: evaluatedDefinition.version,
-              tags: evaluatedDefinition.tags,
-            },
-            globalArgs: reportGlobalArgs,
-            methodArgs: reportMethodArgs,
-            methodName: task.methodName,
-            executionStatus: "succeeded",
-            dataHandles,
-            outputSpecs: buildOutputSpecs(modelDef),
-            extensionFilesRoot: modelDef.extensionFilesRoot,
-          },
-        );
-
-        await executeReports(
-          reportRegistry,
-          methodContext,
-          modelType,
-          evaluatedDefinition.id,
-          originalDefinition.reportSelection,
-          ctx.reportFilterOptions,
-          reportEventCallbacks,
-          task.methodName,
-          stepModelTypeReports,
-          reportVarySuffix,
-        );
-
-        // Model-scope reports
-        await executeReports(
-          reportRegistry,
-          { ...methodContext, scope: "model" },
-          modelType,
-          evaluatedDefinition.id,
-          originalDefinition.reportSelection,
-          ctx.reportFilterOptions,
-          reportEventCallbacks,
-          task.methodName,
-          stepModelTypeReports,
-          reportVarySuffix,
-        );
-      }
-
-      return {
-        type: "model_method",
-        model: task.modelIdOrName,
-        method: task.methodName,
-        resources,
-        files,
-        dataArtifacts: savedArtifacts,
-        dataHandles: result.dataHandles ?? [],
-      };
-    } catch (error) {
-      // Recover data handles written before the throw (e.g. model wrote data
-      // then threw on verdict=FAIL). The driver attaches them to the error.
-      const errorHandles = (error as Record<string, unknown>).dataHandles as
-        | import("../models/model.ts").DataHandle[]
-        | undefined;
-      if (errorHandles && errorHandles.length > 0) {
-        for (const handle of errorHandles) {
-          const artifactRef = {
-            dataId: handle.dataId,
-            name: handle.name,
-            version: handle.version,
-            tags: handle.tags,
-          };
-          output.addDataArtifact(artifactRef);
-          savedArtifacts.push(artifactRef);
-        }
-      }
-
-      // Mark output as failed and save
-      const errorMessage = error instanceof Error
-        ? error.message
-        : String(error);
-      const errorStack = error instanceof Error ? error.stack : undefined;
-      output.markFailed({ message: errorMessage, stack: errorStack });
-      await outputRepo.save(modelType, task.methodName, output);
-
-      runLogger.debug("Method {method} failed: {error}", {
-        method: task.methodName,
-        model: originalDefinition.name,
-        error: errorMessage,
+        originalDefinition,
+        evaluatedDefinition,
+        runLogger,
+        secretBag,
       });
 
-      // Run method-summary report for failed executions so report consumers
-      // see structured error output (matching modelMethodRun failure behavior).
-      try {
-        if (
-          reportRegistry.getAll().length > 0 && ctx.reportFilterOptions
-        ) {
-          const failedMethodContext = buildMethodReportContext(
-            {
-              repoDir: ctx.repoDir,
-              logger: runLogger,
-              dataRepository: unifiedDataRepo,
-              definitionRepository: definitionRepo,
-              swampSha: ctx.swampSha,
-            },
-            {
-              modelType,
-              modelId: evaluatedDefinition.id,
-              definition: {
-                id: evaluatedDefinition.id,
-                name: evaluatedDefinition.name,
-                version: evaluatedDefinition.version,
-                tags: evaluatedDefinition.tags,
-              },
-              globalArgs: reportGlobalArgs,
-              methodArgs: reportMethodArgs,
-              methodName: task.methodName,
-              executionStatus: "failed",
-              errorMessage,
-              dataHandles: [],
-              outputSpecs: buildOutputSpecs(modelDef),
-              extensionFilesRoot: modelDef.extensionFilesRoot,
-            },
-          );
-
-          const stepModelDef = modelRegistry.get(modelType);
-          const stepModelTypeReports = [
-            ...BUILTIN_METHOD_REPORTS,
-            ...(stepModelDef?.reports ?? []),
-          ];
-
-          const reportEventCallbacks: ReportEventCallback = {
-            onReportStarted: (name, scope) => {
-              ctx.emitEvent?.({
-                kind: "report_started",
-                reportName: name,
-                scope,
-                jobId: ctx.jobName,
-                stepId: ctx.stepName,
-              });
-            },
-            onReportCompleted: (
-              name,
-              scope,
-              markdown,
-              json,
-            ) => {
-              ctx.emitEvent?.({
-                kind: "report_completed",
-                reportName: name,
-                scope,
-                markdown,
-                json,
-                jobId: ctx.jobName,
-                stepId: ctx.stepName,
-              });
-            },
-            onReportFailed: (name, scope, reportError) => {
-              ctx.emitEvent?.({
-                kind: "report_failed",
-                reportName: name,
-                scope,
-                error: reportError,
-                jobId: ctx.jobName,
-                stepId: ctx.stepName,
-              });
-            },
-          };
-
-          await executeReports(
-            reportRegistry,
-            failedMethodContext,
-            modelType,
-            evaluatedDefinition.id,
-            originalDefinition.reportSelection,
-            ctx.reportFilterOptions,
-            reportEventCallbacks,
-            task.methodName,
-            stepModelTypeReports,
-          );
-        }
-      } catch (reportError) {
-        // Don't mask the original execution error with a report error
-        runLogger.debug(
-          "Failed to run reports for failed method: {error}",
-          {
-            error: reportError instanceof Error
-              ? reportError.message
-              : String(reportError),
-          },
-        );
-      }
-
-      // Attach saved artifacts to the error so the outer step loop can
-      // record them in the step run even though the step failed.
-      if (savedArtifacts.length > 0) {
-        (error as Record<string, unknown>).dataArtifacts = savedArtifacts;
-      }
+      return await this.handleMethodSuccess({
+        task,
+        ctx,
+        outputRepo,
+        unifiedDataRepo,
+        definitionRepo,
+        modelType,
+        modelDef,
+        originalDefinition,
+        evaluatedDefinition,
+        runLogger,
+        reportGlobalArgs,
+        reportMethodArgs,
+        result,
+        output,
+        savedArtifacts,
+      });
+    } catch (error) {
+      await this.handleMethodFailure({
+        task,
+        ctx,
+        outputRepo,
+        unifiedDataRepo,
+        definitionRepo,
+        modelType,
+        modelDef,
+        originalDefinition,
+        evaluatedDefinition,
+        runLogger,
+        reportGlobalArgs,
+        reportMethodArgs,
+        error,
+        output,
+        savedArtifacts,
+      });
       throw error;
     }
   }
 
   /**
-   * Evaluates CEL expressions in a definition, leaving vault expressions raw.
-   * Vault expressions are resolved at runtime only.
+   * Invoke the model method. Builds the per-call tag overrides,
+   * resolves the data-output overrides for vary, finalizes the
+   * driver plan, and dispatches to the method execution service.
+   * Returns the raw method execution result.
    */
-  private async evaluateDefinitionExpressions(
-    definition: Definition,
-    context: ExpressionContext,
-    _repoDir: string,
-  ): Promise<Definition> {
-    const celEvaluator = new CelEvaluator();
-    const definitionData = definition.toData();
-    const expressions = extractExpressions(definitionData);
+  private async invokeMethod(args: {
+    task: {
+      modelIdOrName: string;
+      methodName: string;
+      inputs?: Record<string, unknown>;
+    };
+    ctx: StepExecutionContext;
+    executionService: MethodExecutionService;
+    unifiedDataRepo: UnifiedDataRepository;
+    definitionRepo: DefinitionRepository;
+    dataQueryService: DataQueryService;
+    vaultService: VaultService;
+    modelType: ModelType;
+    modelDef: ModelDefinition;
+    originalDefinition: Definition;
+    evaluatedDefinition: Definition;
+    runLogger: ReturnType<typeof getRunLogger>;
+    secretBag: ReturnType<
+      ExpressionEvaluationService["resolveRuntimeExpressionsInDefinition"]
+    > extends Promise<infer R> ? R extends { secretBag: infer S } ? S : never
+      : never;
+  }): Promise<MethodResult> {
+    const {
+      task,
+      ctx,
+      executionService,
+      unifiedDataRepo,
+      definitionRepo,
+      dataQueryService,
+      vaultService,
+      modelType,
+      modelDef,
+      originalDefinition,
+      evaluatedDefinition,
+      runLogger,
+      secretBag,
+    } = args;
 
-    if (expressions.length === 0) {
-      return definition;
-    }
+    runLogger.debug("Executing method {method}", { method: task.methodName });
+    ctx.emitEvent?.({
+      kind: "method_executing",
+      jobId: ctx.jobName,
+      stepId: ctx.stepName,
+      modelName: originalDefinition.name,
+      methodName: task.methodName,
+    });
 
-    // Evaluate CEL-only expressions; skip runtime expressions (vault, env)
-    const evaluatedValues = new Map<string, unknown>();
-    for (const expr of expressions) {
-      if (containsRuntimeExpression(expr.celExpression)) {
-        continue;
-      }
+    // Build workflow-specific tag overrides. Use "source" instead of
+    // "type" to preserve the original data type (resource/file) while
+    // tracking provenance for cross-workflow resolution.
+    const workflowTagOverrides: Record<string, string> = {
+      ...(ctx.workflowTags ?? {}),
+      source: "step-output",
+      workflow: ctx.workflowName,
+      workflowRunId: ctx.workflowRunId,
+      step: ctx.stepName,
+    };
 
-      // Skip expressions referencing model resource/file data that isn't
-      // available in context (e.g., referenced model was never executed).
-      // Unlike inputs, model data is never conditionally accessed in CEL —
-      // member access on a missing model ref is always an error.
-      let hasMissingModelDep = false;
-      const deps = extractDependencies(expr.celExpression);
-      for (const dep of deps) {
-        if (dep.type === "resource" || dep.type === "file") {
-          const modelData = context.model[dep.modelRef];
-          if (
-            !modelData ||
-            (dep.type === "resource" && !modelData.resource) ||
-            (dep.type === "file" && !modelData.file)
-          ) {
-            hasMissingModelDep = true;
-            break;
+    // Resolve vary suffixes per output spec from current step inputs.
+    const stepDataOutputOverrides = ctx.step?.dataOutputOverrides
+      ? Array.from(ctx.step.dataOutputOverrides).map((override) => {
+        let resolvedVarySuffix: string | undefined;
+        if (override.vary && override.vary.length > 0) {
+          const inputs = ctx.expressionContext?.inputs ?? {};
+          const varyValues = override.vary.map((key) => {
+            const val = inputs[key];
+            if (val === undefined || val === null) {
+              throw new UserError(
+                `Vary dimension '${key}' not found in step inputs for spec '${override.specName}'`,
+              );
+            }
+            return coerceToSuffix(val);
+          });
+          resolvedVarySuffix = varyValues.join("-");
+        }
+        return {
+          specName: override.specName,
+          lifetime: override.lifetime,
+          garbageCollection: override.garbageCollection,
+          tags: override.tags,
+          resolvedVarySuffix,
+        };
+      })
+      : undefined;
+
+    // Finalize driver resolution. When no plan was passed (legacy
+    // callers), fall back to "raw".
+    const resolved = ctx.driverPlan?.withDefinition({
+      driver: evaluatedDefinition.driver,
+      driverConfig: evaluatedDefinition.driverConfig,
+    }) ?? { driver: "raw" };
+
+    // Execute the method with the EVALUATED definition. The logger
+    // handles both console and file persistence via RunFileSink. Data
+    // is persisted by DataWriter during execution — no double-save.
+    return await executionService.executeWorkflow(
+      evaluatedDefinition,
+      modelDef,
+      task.methodName,
+      buildMethodContext(
+        {
+          dataRepository: unifiedDataRepo,
+          definitionRepository: definitionRepo,
+          vaultService,
+          redactor: ctx.secretRedactor,
+          dataQueryService,
+        },
+        {
+          signal: ctx.signal,
+          repoDir: ctx.repoDir,
+          modelType,
+          modelId: evaluatedDefinition.id,
+          globalArgs: evaluatedDefinition.globalArguments,
+          definition: {
+            id: evaluatedDefinition.id,
+            name: evaluatedDefinition.name,
+            version: evaluatedDefinition.version,
+            tags: evaluatedDefinition.tags,
+          },
+          methodName: task.methodName,
+          logger: runLogger,
+          tagOverrides: workflowTagOverrides,
+          runtimeTags: ctx.runtimeTags,
+          dataOutputOverrides: stepDataOutputOverrides,
+          vaultSecrets: secretBag,
+          driver: resolved.driver,
+          driverConfig: resolved.driverConfig,
+          skipCheckNames: ctx.skipCheckNames,
+          skipCheckLabels: ctx.skipCheckLabels,
+          skipAllChecks: ctx.skipAllChecks,
+          extensionFilesRoot: modelDef.extensionFilesRoot,
+          onEvent: ctx.emitEvent
+            ? (event: MethodExecutionEvent) => {
+              if (event.type === "output") {
+                ctx.emitEvent!({
+                  kind: "method_output",
+                  jobId: ctx.jobName,
+                  stepId: ctx.stepName,
+                  modelName: originalDefinition.name,
+                  methodName: task.methodName,
+                  stream: event.stream,
+                  line: event.line,
+                });
+              } else {
+                ctx.emitEvent!({
+                  kind: "method_event",
+                  jobId: ctx.jobName,
+                  stepId: ctx.stepName,
+                  modelName: originalDefinition.name,
+                  methodName: task.methodName,
+                  event,
+                });
+              }
+            }
+            : undefined,
+        },
+      ),
+    );
+  }
+
+  /**
+   * Success-path handler. Owns all mutations of `output` and
+   * `savedArtifacts` for the success case: appends method artifacts,
+   * appends report artifacts, marks the output as succeeded, persists.
+   * Returns the orchestrator's final result tuple.
+   */
+  private async handleMethodSuccess(args: {
+    task: {
+      modelIdOrName: string;
+      methodName: string;
+      inputs?: Record<string, unknown>;
+    };
+    ctx: StepExecutionContext;
+    outputRepo: OutputRepository;
+    unifiedDataRepo: UnifiedDataRepository;
+    definitionRepo: DefinitionRepository;
+    modelType: ModelType;
+    modelDef: ModelDefinition;
+    originalDefinition: Definition;
+    evaluatedDefinition: Definition;
+    runLogger: ReturnType<typeof getRunLogger>;
+    reportGlobalArgs: Record<string, unknown>;
+    reportMethodArgs: Record<string, unknown>;
+    result: MethodResult;
+    output: ModelOutput;
+    savedArtifacts: Array<{
+      dataId: string;
+      name: string;
+      version: number;
+      tags: Record<string, string>;
+    }>;
+  }): Promise<unknown> {
+    const {
+      task,
+      ctx,
+      outputRepo,
+      unifiedDataRepo,
+      definitionRepo,
+      modelType,
+      modelDef,
+      originalDefinition,
+      evaluatedDefinition,
+      runLogger,
+      reportGlobalArgs,
+      reportMethodArgs,
+      result,
+      output,
+      savedArtifacts,
+    } = args;
+
+    // Track data outputs for context refresh (specName → instanceName → record).
+    const resources: Record<string, Record<string, DataRecord>> = {};
+    const files: Record<string, Record<string, FileDataRecord>> = {};
+
+    // Append method artifacts to output and savedArtifacts; build the
+    // resources/files maps used by downstream steps' expression context.
+    if (result.dataHandles && result.dataHandles.length > 0) {
+      for (const handle of result.dataHandles) {
+        const artifactRef = {
+          dataId: handle.dataId,
+          name: handle.name,
+          version: handle.version,
+          tags: handle.tags,
+        };
+        output.addDataArtifact(artifactRef);
+        savedArtifacts.push(artifactRef);
+
+        const dataPath = unifiedDataRepo.getPath(
+          modelType,
+          evaluatedDefinition.id,
+          handle.name,
+          handle.version,
+        );
+        runLogger.debug("Data saved to {path}", { path: dataPath });
+
+        if (handle.kind === "resource") {
+          let attributes: Record<string, unknown> = {};
+          if (handle.metadata.contentType === "application/json") {
+            try {
+              const content = await unifiedDataRepo.getContent(
+                modelType,
+                evaluatedDefinition.id,
+                handle.name,
+                handle.version,
+              );
+              if (content) {
+                const text = new TextDecoder().decode(content);
+                attributes = JSON.parse(text) as Record<string, unknown>;
+              }
+            } catch {
+              // Not valid JSON, skip attributes
+            }
+          }
+          if (!resources[handle.specName]) {
+            resources[handle.specName] = {};
+          }
+          resources[handle.specName][handle.name] = {
+            id: handle.dataId,
+            name: handle.name,
+            version: handle.version,
+            // The resource was just saved by the current step, so this
+            // record is authoritative for the data item.
+            isLatest: true,
+            createdAt: new Date().toISOString(),
+            attributes,
+            tags: handle.tags,
+            modelName: handle.tags["modelName"] ?? evaluatedDefinition.name,
+            modelType: modelType.normalized,
+            specName: handle.specName,
+            dataType: handle.tags["type"] ?? "resource",
+            contentType: handle.metadata.contentType,
+            lifetime: handle.metadata.lifetime,
+            ownerType: handle.metadata.ownerDefinition.ownerType,
+            streaming: handle.metadata.streaming,
+            size: handle.size,
+            content: "",
+            ownerRef: handle.metadata.ownerDefinition.ownerRef,
+            workflowRunId: handle.metadata.ownerDefinition.workflowRunId ?? "",
+            workflowName: handle.metadata.ownerDefinition.workflowName ?? "",
+            jobName: handle.metadata.ownerDefinition.jobName ?? "",
+            stepName: handle.metadata.ownerDefinition.stepName ?? "",
+            source: handle.metadata.ownerDefinition.source ?? "",
+          };
+        } else if (handle.kind === "file") {
+          const contentPath = unifiedDataRepo.getContentPath(
+            modelType,
+            evaluatedDefinition.id,
+            handle.name,
+            handle.version,
+          );
+          try {
+            const stat = await Deno.stat(contentPath);
+            if (!files[handle.specName]) files[handle.specName] = {};
+            files[handle.specName][handle.name] = {
+              id: handle.dataId,
+              version: handle.version,
+              createdAt: new Date().toISOString(),
+              path: contentPath,
+              size: stat.size,
+              contentType: handle.metadata.contentType,
+            };
+          } catch {
+            // File not found, skip
           }
         }
       }
+    }
 
-      if (hasMissingModelDep) {
-        continue;
-      }
+    output.markSucceeded();
+    await outputRepo.save(modelType, task.methodName, output);
 
-      try {
-        const value = await celEvaluator.evaluateAsync(
-          expr.celExpression,
-          context,
-        );
-        evaluatedValues.set(expr.raw, value);
-      } catch {
-        // Leave unresolved — CEL threw because an input referenced directly
-        // (not inside a conditional branch) is absent from context.
-        // The Proxy on globalArgs will surface a clear error if the method
-        // actually needs the unresolved value.
+    runLogger.with({ summary: true }).debug(
+      "Method {method} completed on {model}",
+      { method: task.methodName, model: originalDefinition.name },
+    );
+
+    // Per-step reports. Vary suffix derived from forEach variable.
+    if (ctx.reportFilterOptions) {
+      const reportVarySuffix = ctx.forEachVariable?.value !== undefined
+        ? coerceToSuffix(ctx.forEachVariable.value)
+        : undefined;
+
+      const reportArtifacts = await this.reportRunner.runFor({
+        status: "succeeded",
+        dataHandles: result.dataHandles ?? [],
+        modelType,
+        modelDef,
+        evaluatedDefinition,
+        originalDefinition,
+        methodName: task.methodName,
+        reportGlobalArgs,
+        reportMethodArgs,
+        reportFilterOptions: ctx.reportFilterOptions,
+        reportVarySuffix,
+        repoDir: ctx.repoDir,
+        swampSha: ctx.swampSha,
+        runLogger,
+        unifiedDataRepo,
+        definitionRepository: definitionRepo,
+        emitEvent: ctx.emitEvent,
+        jobName: ctx.jobName,
+        stepName: ctx.stepName,
+      });
+      for (const artifact of reportArtifacts) {
+        output.addDataArtifact(artifact);
+        savedArtifacts.push(artifact);
       }
     }
 
-    // Replace only CEL-only expressions with evaluated values
-    const evaluatedData = replaceExpressions(definitionData, evaluatedValues);
+    return {
+      type: "model_method",
+      model: task.modelIdOrName,
+      method: task.methodName,
+      resources,
+      files,
+      dataArtifacts: savedArtifacts,
+      dataHandles: result.dataHandles ?? [],
+    };
+  }
 
-    // Create new Definition from evaluated data
-    const { Definition: DefClass } = await import(
-      "../definitions/definition.ts"
-    );
-    return DefClass.fromData(
-      evaluatedData as ReturnType<typeof definition.toData>,
-    );
+  /**
+   * Failure-path handler. Owns all mutations of `output` and
+   * `savedArtifacts` for the failure case: recovers handles attached
+   * to the error (partial-write artifacts), marks the output as failed,
+   * persists, runs failure-path reports (errors swallowed by the runner),
+   * and attaches savedArtifacts to the error so the outer step loop
+   * records them on the step run. Caller is expected to rethrow.
+   */
+  private async handleMethodFailure(args: {
+    task: {
+      modelIdOrName: string;
+      methodName: string;
+      inputs?: Record<string, unknown>;
+    };
+    ctx: StepExecutionContext;
+    outputRepo: OutputRepository;
+    unifiedDataRepo: UnifiedDataRepository;
+    definitionRepo: DefinitionRepository;
+    modelType: ModelType;
+    modelDef: ModelDefinition;
+    originalDefinition: Definition;
+    evaluatedDefinition: Definition;
+    runLogger: ReturnType<typeof getRunLogger>;
+    reportGlobalArgs: Record<string, unknown>;
+    reportMethodArgs: Record<string, unknown>;
+    error: unknown;
+    output: ModelOutput;
+    savedArtifacts: Array<{
+      dataId: string;
+      name: string;
+      version: number;
+      tags: Record<string, string>;
+    }>;
+  }): Promise<void> {
+    const {
+      task,
+      ctx,
+      outputRepo,
+      unifiedDataRepo,
+      definitionRepo,
+      modelType,
+      modelDef,
+      originalDefinition,
+      evaluatedDefinition,
+      runLogger,
+      reportGlobalArgs,
+      reportMethodArgs,
+      error,
+      output,
+      savedArtifacts,
+    } = args;
+
+    // Recover data handles written before the throw (e.g. model wrote
+    // data then threw on verdict=FAIL). The driver attaches them to
+    // the error.
+    const errorHandles = (error as Record<string, unknown>).dataHandles as
+      | import("../models/model.ts").DataHandle[]
+      | undefined;
+    if (errorHandles && errorHandles.length > 0) {
+      for (const handle of errorHandles) {
+        const artifactRef = {
+          dataId: handle.dataId,
+          name: handle.name,
+          version: handle.version,
+          tags: handle.tags,
+        };
+        output.addDataArtifact(artifactRef);
+        savedArtifacts.push(artifactRef);
+      }
+    }
+
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorStack = error instanceof Error ? error.stack : undefined;
+    output.markFailed({ message: errorMessage, stack: errorStack });
+    await outputRepo.save(modelType, task.methodName, output);
+
+    runLogger.debug("Method {method} failed: {error}", {
+      method: task.methodName,
+      model: originalDefinition.name,
+      error: errorMessage,
+    });
+
+    // Run method-summary report for failed executions so report
+    // consumers see structured error output (matching modelMethodRun
+    // failure behavior). The runner's internal try/catch ensures
+    // report errors don't mask the original execution error.
+    if (ctx.reportFilterOptions) {
+      await this.reportRunner.runFor({
+        status: "failed",
+        errorMessage,
+        dataHandles: [],
+        modelType,
+        modelDef,
+        evaluatedDefinition,
+        originalDefinition,
+        methodName: task.methodName,
+        reportGlobalArgs,
+        reportMethodArgs,
+        reportFilterOptions: ctx.reportFilterOptions,
+        repoDir: ctx.repoDir,
+        swampSha: ctx.swampSha,
+        runLogger,
+        unifiedDataRepo,
+        definitionRepository: definitionRepo,
+        emitEvent: ctx.emitEvent,
+        jobName: ctx.jobName,
+        stepName: ctx.stepName,
+      });
+    }
+
+    // Attach saved artifacts to the error so the outer step loop can
+    // record them on the StepRun.
+    if (savedArtifacts.length > 0) {
+      (error as Record<string, unknown>).dataArtifacts = savedArtifacts;
+    }
   }
 }
 
@@ -1080,81 +1067,6 @@ interface StepOptions {
 }
 
 /**
- * Result of resolving a forEach step name template.
- */
-export interface ResolvedStepName {
-  /** The resolved step name. */
-  name: string;
-  /** Whether any expression evaluation failed during resolution. */
-  hadEvalFailure: boolean;
-}
-
-/** Maximum length for a coerced suffix before truncation. */
-const MAX_SUFFIX_LENGTH = 64;
-
-/**
- * Safely converts an unknown value to a string suitable for use as a data
- * artifact name suffix. For objects, tries common identifier properties
- * (`key`, `name`, `id`) before falling back to a truncated JSON representation.
- */
-export function coerceToSuffix(val: unknown): string {
-  if (val === undefined || val === null) {
-    return "";
-  }
-  if (typeof val !== "object") {
-    return String(val);
-  }
-  const obj = val as Record<string, unknown>;
-  for (const prop of ["key", "name", "id"]) {
-    if (prop in obj && obj[prop] !== undefined && obj[prop] !== null) {
-      return String(obj[prop]);
-    }
-  }
-  const json = JSON.stringify(val);
-  if (json.length <= MAX_SUFFIX_LENGTH) {
-    return json;
-  }
-  return json.slice(0, MAX_SUFFIX_LENGTH);
-}
-
-/**
- * Resolves a forEach step name template by evaluating `${{ }}` expressions,
- * or falls back to appending a suffix when no expressions are present.
- *
- * When expression evaluation fails, the raw expression is preserved and the
- * fallbackSuffix is appended to ensure uniqueness across iterations.
- */
-export function resolveForEachStepName(
-  template: string,
-  hasExpression: boolean,
-  stepContext: Record<string, unknown>,
-  celEvaluator: CelEvaluator,
-  fallbackSuffix: string,
-): ResolvedStepName {
-  if (hasExpression) {
-    let hadEvalFailure = false;
-    const resolved = template.replace(
-      /\$\{\{\s*(.+?)\s*\}\}/g,
-      (_match, expr) => {
-        try {
-          return String(
-            celEvaluator.evaluate(expr as string, stepContext),
-          );
-        } catch {
-          hadEvalFailure = true;
-          return _match as string;
-        }
-      },
-    );
-    return {
-      name: hadEvalFailure ? `${resolved}-${fallbackSuffix}` : resolved,
-      hadEvalFailure,
-    };
-  }
-  return { name: `${template}-${fallbackSuffix}`, hadEvalFailure: false };
-}
-
-/**
  * Domain service for workflow execution.
  */
 export class WorkflowExecutionService {
@@ -1172,6 +1084,8 @@ export class WorkflowExecutionService {
    * picks up marker edits between requests.
    */
   private readonly loadRepoMarker: () => Promise<RepoMarkerData | null>;
+  /** Evaluator for sub-workflow input expressions. Per-instance, not per-call. */
+  private readonly expressionEvaluator: ExpressionEvaluationService;
 
   constructor(
     private readonly workflowRepo: WorkflowRepository,
@@ -1196,6 +1110,10 @@ export class WorkflowExecutionService {
       dataRepo: this.dataRepo,
       dataQueryService,
     });
+    this.expressionEvaluator = new ExpressionEvaluationService(
+      this.definitionRepo,
+      repoDir,
+    );
     this.loadRepoMarker = createRepoMarkerLoader(this.markerRepo, repoDir);
   }
 
@@ -1280,10 +1198,7 @@ export class WorkflowExecutionService {
           expressionContext.inputs = options.inputs;
         }
 
-        workflow = await this.evaluateWorkflow(
-          workflow,
-          expressionContext,
-        );
+        workflow = await this.evaluateWorkflow(workflow, expressionContext);
         const evaluatedWorkflowRepo = new YamlEvaluatedWorkflowRepository(
           this.repoDir,
         );
@@ -1467,10 +1382,8 @@ export class WorkflowExecutionService {
       // Expand forEach steps if we have expression context
       let expandedStepsMap: Map<string, ExpandedStep[]> | undefined;
       if (expressionContext && !options.lastEvaluated) {
-        expandedStepsMap = await this.expandForEachSteps(
-          job,
-          expressionContext,
-        );
+        expandedStepsMap = await new ForEachExpansionService(new CelEvaluator())
+          .expand(job, expressionContext);
         // Rewrite the jobRun's step list to match the expansion. The
         // template StepRun (the step as written in the workflow) never
         // executes once forEach expands, so leaving it in place makes it
@@ -1593,160 +1506,6 @@ export class WorkflowExecutionService {
   }
 
   /**
-   * Expands forEach steps into multiple concrete steps.
-   * For steps with forEach, evaluates the `in` expression and creates
-   * one expanded step per item in the result.
-   *
-   * @param job - The job containing steps
-   * @param context - Expression context for evaluating forEach.in
-   * @returns Map of original step name to expanded steps (or single entry for non-forEach steps)
-   */
-  private async expandForEachSteps(
-    job: Job,
-    context: ExpressionContext,
-  ): Promise<Map<string, ExpandedStep[]>> {
-    const celEvaluator = new CelEvaluator();
-    const result = new Map<string, ExpandedStep[]>();
-
-    for (const step of job.steps) {
-      if (!step.forEach) {
-        // No forEach - use original step as-is
-        result.set(step.name, [{
-          step,
-          expandedName: step.name,
-          forEachVar: { name: "", value: undefined },
-        }]);
-        continue;
-      }
-
-      // Evaluate the forEach.in expression
-      const inExpression = step.forEach.in;
-      const itemName = step.forEach.item;
-
-      // Extract the CEL expression (remove ${{ }})
-      const match = inExpression.match(/\$\{\{\s*(.+?)\s*\}\}/);
-      if (!match) {
-        throw new UserError(
-          `Invalid forEach.in expression: ${inExpression}. Must be in $\{{ }} format.`,
-        );
-      }
-
-      const celExpr = match[1];
-      // Async evaluator so data.* helpers that return Promises (latest,
-      // findByTag, findBySpec, query, etc.) resolve here before we iterate.
-      // cel-js natively propagates Promises through operators and method
-      // calls; `await` on the Environment.evaluate result yields the
-      // resolved value.
-      const items = await celEvaluator.evaluateAsync(celExpr, context);
-
-      // Handle both arrays and objects
-      const expandedSteps: ExpandedStep[] = [];
-
-      const nameHasExpression = /\$\{\{.+?\}\}/.test(step.name);
-
-      if (Array.isArray(items)) {
-        // Array iteration: self.{item} = item value
-        for (let index = 0; index < items.length; index++) {
-          const item = items[index];
-          // Evaluate the step name with the forEach context
-          const stepContext = {
-            ...context,
-            self: {
-              ...context.self,
-              [itemName]: item,
-            },
-          };
-
-          // Resolve step name expressions or fall back to a unique suffix.
-          // For the expression-failure path, always use index for uniqueness.
-          // For the no-expression path, use item value for primitives, index for objects.
-          const fallbackSuffix = nameHasExpression
-            ? String(index)
-            : (item !== null && typeof item === "object")
-            ? String(index)
-            : String(item);
-          if (
-            !nameHasExpression && item !== null && typeof item === "object"
-          ) {
-            getLogger(["swamp", "workflows"]).warn(
-              "forEach step '{stepName}' uses index-based naming because item is an object. " +
-                "Consider adding a ${{{{ self.{itemName}.<field> }}}} expression to the step name for better observability.",
-              { stepName: step.name, itemName },
-            );
-          }
-          const { name: expandedName, hadEvalFailure } = resolveForEachStepName(
-            step.name,
-            nameHasExpression,
-            stepContext,
-            celEvaluator,
-            fallbackSuffix,
-          );
-          if (hadEvalFailure) {
-            getLogger(["swamp", "workflows"]).warn(
-              "forEach step '{stepName}' has expression(s) that failed to evaluate for item at index {index}. " +
-                "Appending index to prevent duplicate names. " +
-                "Check that the expression references valid properties on self.{itemName}.",
-              { stepName: step.name, index, itemName },
-            );
-          }
-
-          expandedSteps.push({
-            step,
-            expandedName,
-            forEachVar: { name: itemName, value: item },
-          });
-        }
-      } else if (items && typeof items === "object") {
-        // Object iteration: self.{item} = { key, value }
-        for (const [key, value] of Object.entries(items)) {
-          const objItem = { key, value };
-
-          // Evaluate the step name with the forEach context
-          const stepContext = {
-            ...context,
-            self: {
-              ...context.self,
-              [itemName]: objItem,
-            },
-          };
-
-          // Resolve step name expressions or fall back to key suffix
-          const { name: expandedName, hadEvalFailure } = resolveForEachStepName(
-            step.name,
-            nameHasExpression,
-            stepContext,
-            celEvaluator,
-            key,
-          );
-          if (hadEvalFailure) {
-            getLogger(["swamp", "workflows"]).warn(
-              "forEach step '{stepName}' has expression(s) that failed to evaluate for key '{key}'. " +
-                "Appending key to prevent duplicate names. " +
-                "Check that the expression references valid properties on self.{itemName}.",
-              { stepName: step.name, key, itemName },
-            );
-          }
-
-          expandedSteps.push({
-            step,
-            expandedName,
-            forEachVar: { name: itemName, value: objItem },
-          });
-        }
-      } else {
-        throw new UserError(
-          `forEach.in must evaluate to an array or object, got: ${typeof items}`,
-        );
-      }
-
-      // If no items, still store empty array
-      result.set(step.name, expandedSteps);
-    }
-
-    return result;
-  }
-
-  /**
    * Executes a step (regular or forEach-expanded), yielding events.
    * Catches errors internally to preserve allSettled semantics via merge().
    */
@@ -1860,12 +1619,12 @@ export class WorkflowExecutionService {
           expressionContext: stepExprContext,
           workflowRun: run,
           step,
-          useLastEvaluated: options.lastEvaluated,
+          mode: options.lastEvaluated ? "lastEvaluated" : "fresh",
           forEachVariable: forEachVar,
           workflowTags: options.workflowTags,
           runtimeTags: options.runtimeTags,
           secretRedactor: options.secretRedactor,
-          driverTiers: {
+          driverPlan: new DriverPlan({
             cli: { driver: options.driver },
             step: { driver: step.driver, driverConfig: step.driverConfig },
             job: { driver: job.driver, driverConfig: job.driverConfig },
@@ -1877,7 +1636,7 @@ export class WorkflowExecutionService {
               driver: repoMarker?.defaultDriver,
               driverConfig: repoMarker?.defaultDriverConfig,
             },
-          },
+          }),
           emitEvent: push,
           reportFilterOptions: options.reportFilterOptions,
           swampSha: options.swampSha,
@@ -2059,20 +1818,20 @@ export class WorkflowExecutionService {
       return;
     }
 
-    // Evaluate inputs using the expression context
+    // Evaluate inputs using the expression context. Reuse the
+    // per-instance evaluator (was previously constructed per call).
     let evaluatedInputs = task.inputs;
     if (task.inputs && expressionContext) {
-      const evalService = new ExpressionEvaluationService(
-        new YamlDefinitionRepository(this.repoDir),
-        this.repoDir,
-      );
-      evaluatedInputs = await evalService.evaluateData(
+      evaluatedInputs = await this.expressionEvaluator.evaluateData(
         task.inputs,
         expressionContext,
       ) as Record<string, unknown>;
     }
 
-    // Create a child WorkflowExecutionService with nesting context
+    // Create a child WorkflowExecutionService with nesting context.
+    // Share the parent's executor so child workflows reuse its
+    // (possibly injected) deps — without this, every level of nesting
+    // forces a fresh executor with its own per-call construction.
     const childAncestors = new Set(ancestors);
     childAncestors.add(workflow.name);
 
@@ -2080,7 +1839,7 @@ export class WorkflowExecutionService {
       this.workflowRepo,
       this.runRepo,
       this.repoDir,
-      undefined,
+      this.executor,
       this.dataBaseDir,
       this.catalogStore,
     );
@@ -2185,10 +1944,8 @@ export class WorkflowExecutionService {
   }
 
   /**
-   * Evaluates CEL expressions in a workflow, leaving vault expressions raw.
-   * Vault expressions are resolved at runtime only.
-   * forEach-related expressions (self.* and forEach.in) are left raw for
-   * runtime expansion.
+   * Evaluates CEL expressions in a workflow via WorkflowExpressionEvaluator,
+   * carrying the tracing span this orchestrator opened around the call.
    */
   private async evaluateWorkflow(
     workflow: Workflow,
@@ -2199,68 +1956,15 @@ export class WorkflowExecutionService {
     });
 
     try {
-      const celEvaluator = new CelEvaluator();
-      const workflowData = workflow.toData();
-      const expressions = extractExpressions(workflowData);
-
-      if (expressions.length === 0) {
-        return workflow;
-      }
-
-      // Collect forEach.in expressions to skip during evaluation
-      const forEachInExpressions = new Set<string>();
-      for (const job of workflow.jobs) {
-        for (const step of job.steps) {
-          if (step.forEach) {
-            const match = step.forEach.in.match(/\$\{\{\s*(.+?)\s*\}\}/);
-            if (match) {
-              forEachInExpressions.add(step.forEach.in);
-            }
-          }
-        }
-      }
-
-      // Evaluate CEL-only expressions; skip runtime (vault, env), self.*, and forEach.in expressions
-      const evaluatedValues = new Map<string, unknown>();
-      for (const expr of expressions) {
-        if (containsRuntimeExpression(expr.celExpression)) {
-          continue;
-        }
-        // Skip self.* expressions — they reference forEach variables resolved at runtime
-        if (expr.celExpression.match(/\bself\./)) {
-          continue;
-        }
-        // Skip forEach.in expressions — they must remain as strings for forEach expansion
-        if (forEachInExpressions.has(expr.raw)) {
-          continue;
-        }
-        // Skip task.inputs expressions that depend on step outputs (resource, file, execution, data, file.contents).
-        // These are evaluated at step execution time when upstream step outputs are available.
-        if (
-          isTaskInputsPath(expr.path) &&
-          hasStepOutputDependency(expr.celExpression)
-        ) {
-          continue;
-        }
-
-        const value = await celEvaluator.evaluateAsync(
-          expr.celExpression,
-          context,
-        );
-        evaluatedValues.set(expr.raw, value);
-      }
-
-      // Replace only CEL-only expressions with evaluated values
-      const evaluatedData = replaceExpressions(workflowData, evaluatedValues);
-
-      // Create new Workflow from evaluated data
-      const result = Workflow.fromData(evaluatedData as WorkflowInput);
+      const result = await new WorkflowExpressionEvaluator(
+        new CelEvaluator(),
+      ).evaluate(workflow, context);
       evalSpan.setAttribute(
         "workflow.expressions_evaluated",
-        evaluatedValues.size,
+        result.expressionsEvaluated,
       );
       evalSpan.setStatus({ code: SpanStatusCode.OK });
-      return result;
+      return result.workflow;
     } catch (error) {
       evalSpan.setStatus({
         code: SpanStatusCode.ERROR,
