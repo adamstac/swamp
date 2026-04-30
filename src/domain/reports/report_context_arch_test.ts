@@ -25,10 +25,12 @@
 
 import { assertEquals } from "@std/assert";
 import { walk } from "@std/fs";
-import { relative } from "@std/path";
+import { fromFileUrl, join, relative } from "@std/path";
 
-const REPO_ROOT = new URL("../../..", import.meta.url).pathname;
-const SRC_ROOT = `${REPO_ROOT}src`;
+// Use fromFileUrl so Windows produces "D:\\..." instead of URL-pathname
+// "/D:/..." which Deno.readDir cannot resolve on Windows.
+const REPO_ROOT = fromFileUrl(new URL("../../..", import.meta.url));
+const SRC_ROOT = join(REPO_ROOT, "src");
 
 const ALLOWED_FILES: ReadonlySet<string> = new Set([
   // The factory itself.
@@ -48,7 +50,10 @@ Deno.test("architecture: no inline MethodReportContext literals outside factory 
       followSymlinks: false,
     })
   ) {
-    const rel = relative(REPO_ROOT, entry.path);
+    // Normalize to forward slashes so the ALLOWED_FILES set (which uses
+    // forward slashes) matches on Windows where `relative()` returns
+    // backslash-separated paths.
+    const rel = relative(REPO_ROOT, entry.path).replaceAll("\\", "/");
     if (rel.endsWith("_test.ts")) continue;
     if (ALLOWED_FILES.has(rel)) continue;
 
