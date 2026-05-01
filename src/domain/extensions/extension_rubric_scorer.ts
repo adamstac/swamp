@@ -471,16 +471,31 @@ function symbolsRow(pct: number): RubricFactor {
 
 // ── Tarball extraction + deno doc orchestrator ─────────────────────────
 
+/**
+ * Extracts a `.tar.gz` byte stream into the given directory. Domain owns
+ * the port; the libswamp layer wires in `extractTarGz` from
+ * `infrastructure/archive/tar_archive.ts` so this module doesn't reach
+ * across layers. Tests inject a fake.
+ */
+export type ExtractTarball = (
+  source: ReadableStream<Uint8Array>,
+  destDir: string,
+) => Promise<void>;
+
 /** Injected subprocess deps — makes tests hermetic. */
 export interface RubricScoreDeps {
   runDeno: (
     args: string[],
     cwd: string,
   ) => Promise<{ success: boolean; stdout: string; stderr: string }>;
+  extractTarball: ExtractTarball;
 }
 
-/** Default deps: real `deno` subprocess. */
-export function createRubricScoreDeps(denoPath: string): RubricScoreDeps {
+/** Default deps: real `deno` subprocess plus the supplied tarball extractor. */
+export function createRubricScoreDeps(
+  denoPath: string,
+  extractTarball: ExtractTarball,
+): RubricScoreDeps {
   return {
     runDeno: async (args, cwd) => {
       const cmd = new Deno.Command(denoPath, {
@@ -497,6 +512,7 @@ export function createRubricScoreDeps(denoPath: string): RubricScoreDeps {
         stderr: new TextDecoder().decode(out.stderr),
       };
     },
+    extractTarball,
   };
 }
 
@@ -553,18 +569,16 @@ export async function scoreExtensionTarball(
     await Deno.writeFile(tarballPath, tarballBytes);
     await Deno.mkdir(extractDir);
 
-    // Extract with the system `tar`. The CLI built this tarball itself,
-    // so we skip the server-side Zip-Slip / type checks — we trust our
-    // own output.
-    const tarCmd = new Deno.Command("tar", {
-      args: ["-xzf", tarballPath, "-C", extractDir],
-      stdout: "piped",
-      stderr: "piped",
-    });
-    const tarOut = await tarCmd.output();
-    if (!tarOut.success) {
-      const err = new TextDecoder().decode(tarOut.stderr);
-      throw new Error(`Failed to extract tarball for scoring: ${err}`);
+    // Extract via the injected tarball extractor (libswamp wires in
+    // `extractTarGz` from infrastructure/archive). The CLI built this
+    // tarball itself, so we skip the server-side Zip-Slip / type checks —
+    // we trust our own output.
+    try {
+      const tarFile = await Deno.open(tarballPath, { read: true });
+      await deps.extractTarball(tarFile.readable, extractDir);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to extract tarball for scoring: ${message}`);
     }
 
     // Locate the directory that holds manifest.yaml. Swamp CLI's

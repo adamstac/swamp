@@ -18,30 +18,13 @@
 // along with Swamp.  If not, see <https://www.gnu.org/licenses/>.
 
 /**
- * POSIX PATH binary resolution port.
+ * Cross-platform PATH binary resolution port.
  *
- * Production uses `which` via `Deno.Command`; tests inject a fake.
- * Scoped to POSIX (macOS/Linux) — swamp's supported platforms as of v1.
- * Windows support deferred until a user asks.
+ * Domain declares the contract; the CLI layer wires in
+ * `defaultCommandResolver()` from `infrastructure/process` (POSIX `which`,
+ * Windows `where`) at construction time. Tests inject a fake directly.
  */
 export type ResolveBinary = (name: string) => Promise<string | null>;
-
-/** Default implementation using POSIX `which`. */
-export const resolveBinaryViaWhich: ResolveBinary = async (name) => {
-  try {
-    const cmd = new Deno.Command("which", {
-      args: [name],
-      stdout: "piped",
-      stderr: "null",
-    });
-    const { success, stdout } = await cmd.output();
-    if (!success) return null;
-    const path = new TextDecoder().decode(stdout).trim();
-    return path || null;
-  } catch {
-    return null;
-  }
-};
 
 /** The shell-command binary name for each audit-integrating tool. */
 export function binaryNameFor(tool: string): string {

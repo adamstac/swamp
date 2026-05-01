@@ -20,6 +20,13 @@
 import { assertEquals } from "@std/assert";
 import { EmbeddedDenoRuntime } from "./embedded_deno_runtime.ts";
 
+// The Stream 0 multi-line `which`/`where` parsing regression is exercised
+// directly against `defaultCommandResolver` in
+// `src/infrastructure/process/resolve_command_test.ts` — that's where the
+// parser lives. `EmbeddedDenoRuntime` only forwards to the resolver, so
+// duplicating the test here would not catch any additional drift; the
+// constructor's `commandResolver` argument is the seam should that change.
+
 Deno.test("EmbeddedDenoRuntime returns system deno in dev mode", async () => {
   // When running from source (not compiled), Deno.build.standalone is falsy
   const runtime = new EmbeddedDenoRuntime();
