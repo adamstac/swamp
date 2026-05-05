@@ -36,6 +36,7 @@ import { WorkflowExecutionService } from "../../domain/workflows/execution_servi
 import { createWorkflowId } from "../../domain/workflows/workflow_id.ts";
 import { SWAMP_SUBDIRS } from "../../infrastructure/persistence/paths.ts";
 import { parseInputs } from "../input_parser.ts";
+import { parseTimeout } from "../duration_parser.ts";
 import { GIT_SHA } from "./version.ts";
 import { modelRegistry } from "../../domain/models/model.ts";
 import { vaultTypeRegistry } from "../../domain/vaults/vault_type_registry.ts";
@@ -61,6 +62,10 @@ export const workflowRunCommand = new Command()
   .example(
     "With inputs",
     "swamp workflow run deploy-pipeline --input env=prod",
+  )
+  .example(
+    "Pass an array or object input (JSON-typed via :json suffix)",
+    'swamp workflow run deploy-pipeline --input \'tags:json=["prod","west"]\'',
   )
   .example(
     "With tags",
@@ -121,6 +126,10 @@ export const workflowRunCommand = new Command()
     "--skip-check-label <label:string>",
     "Skip pre-flight checks with this label",
     { collect: true },
+  )
+  .option(
+    "--timeout <duration:string>",
+    "Cancellation deadline — seconds (e.g. 30, 1800) or duration string (e.g. 30s, 5m, 1h). Cooperative — only honored by methods that check AbortSignal.",
   )
   // @ts-expect-error - Cliffy custom type returns unknown instead of string
   .action(async function (options: AnyOptions, workflowIdOrName: string) {
@@ -249,7 +258,13 @@ export const workflowRunCommand = new Command()
         definitionRepo: repoContext.definitionRepo,
       };
 
-      const libCtx = createLibSwampContext();
+      const timeoutMs = options.timeout
+        ? parseTimeout(options.timeout as string)
+        : undefined;
+      const baseLibCtx = createLibSwampContext();
+      const libCtx = timeoutMs !== undefined
+        ? baseLibCtx.withTimeout(timeoutMs)
+        : baseLibCtx;
       const renderer = createWorkflowRunRenderer(ctx.outputMode, {
         workflowName: workflowIdOrName,
         forceLog: ctx.forceLog,

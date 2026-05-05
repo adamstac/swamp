@@ -76,6 +76,13 @@ export const typeSearchCommand = new Command()
   .description("Search for model types")
   .example("Browse all types", "swamp type search")
   .example("Search by keyword", "swamp type search aws")
+  // `--repo-dir` is accepted for agentic-flow consistency with other
+  // commands; type search reads only the global extension catalog and
+  // does not require an initialized repo.
+  .option(
+    "--repo-dir <dir:string>",
+    "Repository directory (env: SWAMP_REPO_DIR; not required for type search)",
+  )
   .arguments("[query:string]")
   .action(async function (options: AnyOptions, query?: string) {
     const ctx = createContext(options as GlobalOptions, ["type", "search"]);
