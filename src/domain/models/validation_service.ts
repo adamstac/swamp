@@ -482,10 +482,14 @@ export class DefaultModelValidationService implements ModelValidationService {
       return Promise.resolve(ValidationResult.pass("Global arguments"));
     }
 
-    // All fields are static, validate normally
+    // All fields are static, validate with strict mode to reject unknown keys
+    const globalArgsSchema = modelDef.globalArguments;
+    const strictGlobalArgs = (
+      globalArgsSchema as unknown as { strict?(): typeof globalArgsSchema }
+    ).strict?.() ?? globalArgsSchema;
     return this.validateWithSchema(
       "Global arguments",
-      modelDef.globalArguments,
+      strictGlobalArgs,
       staticArgs,
     );
   }
@@ -510,7 +514,11 @@ export class DefaultModelValidationService implements ModelValidationService {
         continue;
       }
 
-      const result = methodDef.arguments.safeParse(staticArgs);
+      const methodArgsSchema = methodDef.arguments;
+      const strictMethodArgs = (
+        methodArgsSchema as unknown as { strict?(): typeof methodArgsSchema }
+      ).strict?.() ?? methodArgsSchema;
+      const result = strictMethodArgs.safeParse(staticArgs);
       if (!result.success) {
         errors.push(
           `Method "${methodName}": ${formatZodError(result.error)}`,
