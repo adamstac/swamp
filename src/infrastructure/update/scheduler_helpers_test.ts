@@ -17,8 +17,14 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with Swamp.  If not, see <https://www.gnu.org/licenses/>.
 
-import { assertEquals, assertStringIncludes } from "@std/assert";
 import {
+  assertEquals,
+  assertNotEquals,
+  assertStringIncludes,
+} from "@std/assert";
+import { assertPathStringIncludes } from "../persistence/path_test_helpers.ts";
+import {
+  autoupdateLogDir,
   buildPlist,
   cadenceFromInterval,
   escapeXml,
@@ -30,6 +36,7 @@ import {
 } from "./systemd_scheduler.ts";
 import {
   cadenceFromSchedule,
+  cronLogPath,
   cronSchedule,
   escapeShellPath,
 } from "./cron_scheduler.ts";
@@ -129,4 +136,22 @@ Deno.test("escapeShellPath: escapes single quotes", () => {
 
 Deno.test("escapeShellPath: passes through clean paths", () => {
   assertEquals(escapeShellPath("/usr/local/bin/swamp"), "/usr/local/bin/swamp");
+});
+
+Deno.test("buildPlist: uses log file paths instead of /dev/null", () => {
+  const plist = buildPlist("/usr/local/bin/swamp", "daily");
+  assertStringIncludes(plist, "autoupdate.stdout.log");
+  assertStringIncludes(plist, "autoupdate.stderr.log");
+  assertEquals(plist.includes("/dev/null"), false);
+});
+
+Deno.test("autoupdateLogDir: returns an absolute path under Library/Logs", () => {
+  const dir = autoupdateLogDir();
+  assertPathStringIncludes(dir, "Library/Logs/swamp");
+});
+
+Deno.test("cronLogPath: returns an absolute path", () => {
+  const path = cronLogPath();
+  assertNotEquals(path, "");
+  assertPathStringIncludes(path, "autoupdate-cron.log");
 });

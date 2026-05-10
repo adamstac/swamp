@@ -17,11 +17,13 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with Swamp.  If not, see <https://www.gnu.org/licenses/>.
 
+import { dirname, join } from "@std/path";
 import type {
   AutoupdateScheduler,
   ScheduleStatus,
 } from "../../domain/update/autoupdate_scheduler.ts";
 import type { UpdateCadence } from "../../domain/update/update_preferences.ts";
+import { getSwampDataDir } from "../persistence/paths.ts";
 
 const CRON_MARKER = "# swamp-autoupdate";
 
@@ -65,14 +67,22 @@ async function writeCrontab(content: string): Promise<void> {
   }
 }
 
+export function cronLogPath(): string {
+  return join(getSwampDataDir(), "log", "autoupdate-cron.log");
+}
+
 export class CronScheduler implements AutoupdateScheduler {
   async install(binaryPath: string, cadence: UpdateCadence): Promise<void> {
     await this.remove();
 
+    await Deno.mkdir(dirname(cronLogPath()), { recursive: true });
+
     const existing = await readCrontab();
     const schedule = cronSchedule(cadence);
     const escaped = escapeShellPath(binaryPath);
-    const line = `${schedule} '${escaped}' update --background ${CRON_MARKER}`;
+    const logPath = escapeShellPath(cronLogPath());
+    const line =
+      `${schedule} '${escaped}' update --background > '${logPath}' 2>&1 ${CRON_MARKER}`;
     const newContent = existing.trimEnd() + (existing.trim() ? "\n" : "") +
       line + "\n";
     await writeCrontab(newContent);

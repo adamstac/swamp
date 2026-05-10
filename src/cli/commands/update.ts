@@ -88,6 +88,13 @@ async function runBackgroundUpdate(
   await logRepo.prune(AUTOUPDATE_LOG_RETENTION_DAYS);
 
   ctx.logger.debug`Background update completed: ${entry.outcome}`;
+
+  if (
+    entry.outcome === "error" && entry.error &&
+    entry.error.toLowerCase().includes("permission denied")
+  ) {
+    Deno.exit(1);
+  }
 }
 
 function promptCadence(defaultCadence: UpdateCadence): UpdateCadence {
@@ -117,6 +124,26 @@ async function runSetupAuto(
     );
   }
 
+  const binaryPath = Deno.execPath();
+  const probeFile = binaryPath + ".swamp-write-test";
+  try {
+    await Deno.writeTextFile(probeFile, "");
+    await Deno.remove(probeFile);
+  } catch (error) {
+    if (error instanceof Deno.errors.PermissionDenied) {
+      throw new UserError(
+        `Cannot set up autoupdate: the directory containing ${binaryPath} is not writable.\n` +
+          `The background scheduler runs as your user and cannot replace the binary.\n\n` +
+          `Options:\n` +
+          `  • Change ownership:  sudo chown ${
+            Deno.env.get("USER") ?? "$(whoami)"
+          } ${binaryPath}\n` +
+          `  • Run updates manually:  sudo swamp update`,
+      );
+    }
+    throw error;
+  }
+
   const prefsRepo = new UpdatePreferencesFileRepository();
   const prefs = await prefsRepo.read();
   const logger = ctx.logger;
@@ -124,7 +151,7 @@ async function runSetupAuto(
   const cadence = promptCadence(prefs.cadence);
 
   const scheduler = await createScheduler();
-  await scheduler.install(Deno.execPath(), cadence);
+  await scheduler.install(binaryPath, cadence);
 
   await prefsRepo.write({ ...prefs, enabled: true, cadence });
 
